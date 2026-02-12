@@ -1,0 +1,11 @@
+[package]
+name = "geo-zarr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+image = "0.25.9"
+ndarray = "0.17.2"
+proj = "0.31.0"
+rusqlite = { version = "0.35.0", features = ["bundled"] }
+zarrs = "0.23.0"
