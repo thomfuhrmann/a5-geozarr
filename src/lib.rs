@@ -227,34 +227,37 @@ fn sample_data_var(
     let (x_max_target, y_max_target) = transformer.convert((x_max_source, y_max_source))?;
 
     // Index calculations for bounding box
-    let min_ix = ((x_min_target - x_0) / spacing_x).floor() as u64;
-    let mut min_iy = ((y_min_target - y_0) / spacing_y).floor() as u64;
-    let max_ix = ((x_max_target - x_0) / spacing_x).ceil() as u64;
-    let mut max_iy = ((y_max_target - y_0) / spacing_y).ceil() as u64;
-    println!("max ix: {max_ix:?}");
+    let min_ix = ((x_min_target - x_0) / spacing_x).round() as u64;
+    let mut min_iy = ((y_min_target - y_0) / spacing_y).round() as u64;
+    let max_ix = ((x_max_target - x_0) / spacing_x).round() as u64;
+    let mut max_iy = ((y_max_target - y_0) / spacing_y).round() as u64;
 
-    let shape_x = array_x.shape()[0];
-    let min_ix = min_ix.saturating_sub(1);
-    let max_ix = (max_ix + 1).min(shape_x - 1);
-
-    if min_ix > max_ix || max_ix >= shape_x {
+    let source_width = array_x.shape()[0];
+    if min_ix > max_ix || max_ix >= source_width {
         return Err("Index for x coordinate out of bounds".into());
     }
 
-    let shape_y = array_y.shape()[0];
+    let source_height = array_y.shape()[0];
     if min_iy > max_iy {
         let temp = min_iy;
         min_iy = max_iy;
         max_iy = temp;
     }
-    if min_iy > max_iy || max_iy >= shape_y {
+
+    if min_iy > max_iy || max_iy >= source_height {
         return Err("Index for y coordinate out of bounds".into());
     }
 
     // Calculate the bounding box indices - ToDo: time!
-    let x_range = min_ix..max_ix + 1;
-    let y_range = min_iy..max_iy + 1;
+    let buffer = 5;
+    let min_ix = min_ix.saturating_sub(buffer);
+    let min_iy = min_iy.saturating_sub(buffer);
+    let max_ix = max_ix.saturating_add(buffer);
+    let max_iy = max_iy.saturating_add(buffer);
+    let x_range = min_ix..(max_ix + 1).min(source_width);
+    let y_range = min_iy..(max_iy + 1).min(source_height);
 
+    // Load tile data into memory
     let tile_data =
         data_var.retrieve_array_subset::<ndarray::Array3<f32>>(&[0..1, y_range, x_range])?;
 
@@ -273,36 +276,25 @@ fn sample_data_var(
             let (xt, yt) = transformer.convert((x, y))?;
 
             // Index calculation
-            if i == 255 && j == 0 {
-                let test = ((xt - x_0) / spacing_x).round();
-                println!("x_max: {x_max_source:?}");
-                println!("before trafo: {x:?}");
+            // Use i64 for intermediate calculation to handle coordinates
+            // that might fall slightly outside min_ix/min_iy
+            let abs_ix = ((xt - x_0) / spacing_x).round() as i64;
+            let abs_iy = ((yt - y_0) / spacing_y).round() as i64;
 
-                println!("x_max_trafo: {x_max_target:?}");
-                println!("before trafo: {xt:?}");
-                println!("compare: {test}");
-            }
-            let ix = ((xt - x_0) / spacing_x).round() as u64 - min_ix;
-            let iy = ((yt - y_0) / spacing_y).round() as u64 - min_iy;
-
-            if j == 0 && i == 255 {
-                println!("Range x: {width:?}");
-                println!("Range y: {height:?}");
-                println!("Sampled index x : {ix:?}");
-                println!("Sampled index y : {iy:?}");
-            }
+            // Map to relative index and clamp to the actual loaded tile_data shape
+            let rel_ix = (abs_ix - min_ix as i64).clamp(0, (width - 1) as i64) as usize;
+            let rel_iy = (abs_iy - min_iy as i64).clamp(0, (height - 1) as i64) as usize;
 
             // Bounds check and sample
-            if ix <= width && iy <= height {
-                let value = tile_data[[0, iy as usize, ix as usize]];
-                if value < min {
-                    min = value;
-                }
-                if value > max {
-                    max = value;
-                }
-                sampled_data[i as usize][j as usize] = value;
+            let value = tile_data[[0, rel_iy, rel_ix]];
+            if value < min {
+                min = value;
             }
+            if value > max {
+                max = value;
+            }
+
+            sampled_data[i as usize][j as usize] = value;
         }
     }
 
@@ -317,10 +309,6 @@ fn sample_data_var(
 
             // Scale to 0-255 and clamp to prevent overflow.
             let pixel_val = (val_norm * 255.0).clamp(0.0, 255.0) as u8;
-
-            if y == 255 && x == 0 {
-                println!("{value:?}");
-            }
 
             img.put_pixel(x as u32, (TILE_PIXELS - 1) - y as u32, Luma([pixel_val]));
         }
@@ -358,10 +346,9 @@ mod tests {
     fn test_sample_tile() {
         let path = PathBuf::from(r".\tests\fixtures\latest");
         let store = Arc::new(FilesystemStore::new(&path).unwrap());
-        let tile = Tile::new(9, 275, 177);
+        let tile = Tile::new(10, 558, 356);
         let data_var = Array::open(store.clone(), "/airtemp").unwrap();
         let res = sample_data_var(&tile, store, "/x", "/y", &data_var);
-        println!("{res:?}");
         assert!(res.is_ok());
     }
 }
