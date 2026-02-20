@@ -1,8 +1,8 @@
 {
   "shape": [
-    3,
-    4301,
-    7001
+    8,
+    431,
+    701
   ],
   "data_type": "float32",
   "chunk_grid": {
@@ -10,7 +10,7 @@
     "configuration": {
       "chunk_shape": [
         1,
-        512,
+        431,
         512
       ]
     }

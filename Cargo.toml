@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = "0.4.43"
 image = "0.25.9"
 ndarray = "0.17.2"
 proj = "0.31.0"

@@ -2,7 +2,7 @@
   "attributes": {
     "name": "SNOWGRID",
     "Conventions": "CF-1.8",
-    "title": "snowgrid_INCAPlus_enbal_analysis",
+    "title": "snowgrid_INCAPlus_degday_analysis",
     "institution": "GeoSphere, Austria",
     "source": "modeled data",
     "references": "-",
