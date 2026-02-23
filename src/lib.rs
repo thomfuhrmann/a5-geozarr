@@ -10,7 +10,9 @@ use zarrs::{
     plugin::ZarrVersion,
 };
 
-pub fn enumerate_data_variables(store: Arc<FilesystemStore>) -> Result<(), Box<dyn Error>> {
+pub fn enumerate_data_variables(
+    store: Arc<FilesystemStore>,
+) -> Result<Vec<NodePath>, Box<dyn Error>> {
     let root_path = NodePath::root();
     let root_group = Group::open(store.clone(), root_path.as_str())?;
     let attributes = root_group.attributes();
@@ -33,7 +35,7 @@ pub fn enumerate_data_variables(store: Arc<FilesystemStore>) -> Result<(), Box<d
         .filter_map(|n| match is_data_variable(&n) {
             Ok(true) => {
                 if n.path() != &crs_path {
-                    Some(Ok(n))
+                    Some(Ok(n.path().clone()))
                 } else {
                     None
                 }
@@ -43,7 +45,7 @@ pub fn enumerate_data_variables(store: Arc<FilesystemStore>) -> Result<(), Box<d
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(())
+    Ok(filtered_child_nodes)
 }
 
 /// Get coordinate system definition as WKT-string
@@ -298,6 +300,40 @@ fn sample_data_var(
     Ok(())
 }
 
+pub fn get_spatial_coords(array: &Array<FilesystemStore>) -> Vec<&str> {
+    array
+        .attributes()
+        .get("coordinates")
+        .map(|v| v.as_str())
+        .flatten()
+        .map(|s| s.split(" ").collect::<Vec<_>>())
+        .unwrap_or(vec![])
+}
+
+pub fn get_non_spatial_dims(
+    array: &Array<FilesystemStore>,
+    spatial_dims: &Vec<&str>,
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut non_spatial = vec![];
+
+    let dim_names = array
+        .dimension_names()
+        .as_ref()
+        .ok_or("Could not retrieve dimension names")?;
+
+    for dim_name in dim_names {
+        if let Some(name) = dim_name {
+            let spatial = spatial_dims.iter().any(|&spatial_dim| spatial_dim == name);
+
+            if !spatial {
+                non_spatial.push(name.clone());
+            }
+        }
+    }
+
+    Ok(non_spatial)
+}
+
 const EARTH_CIRCUMFERENCE: f64 = 40_075_016.685_578_5;
 
 /// Calculates the spatial bounding box of a tile
@@ -430,12 +466,15 @@ fn find_closest_binary(
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
     fn test_open_zarr() {
         let path = PathBuf::from(r".\tests\fixtures\latest");
-        //let _ = open_zarr(path);
+        let store = Arc::new(FilesystemStore::new(&path).unwrap());
+        let _ = enumerate_data_variables(store);
     }
 
     // 10/558/356
