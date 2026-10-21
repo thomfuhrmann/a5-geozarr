@@ -1,12 +1,29 @@
 [package]
-name = "geo-zarr"
+name = "geozarr-client"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+a5 = { git = "https://github.com/felixpalmer/a5-rs" }
 chrono = "0.4.43"
 image = "0.25.9"
 ndarray = "0.17.2"
+object_store = { version = "0.14.2", features = [
+    "http",
+    "aws",
+    "azure",
+    "gcp",
+] }
 proj = "0.31.0"
 rusqlite = { version = "0.35.0", features = ["bundled"] }
-zarrs = "0.23.0"
+serde = "1.0.229"
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tilejson = "0.4.4"
+tokio = "1.53.3"
+url = "2.5.8"
+zarrs = { version = "0.23.0", features = ["async"] }
+zarrs_object_store = "0.7.0"
+
+[dev-dependencies]
+csv = "1.4.0"
