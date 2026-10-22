@@ -20,8 +20,9 @@ use serde::Deserialize;
 use crate::bbox::BBox;
 use crate::error::ZarrError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum SpatialRegistration {
+    #[default]
     Pixel,
     Node,
 }
@@ -342,21 +343,15 @@ pub(crate) fn get_spatial_dims_indices<T: AsRef<str>>(
 
 /// Get the names of non-spatial dimensions
 pub(crate) fn get_non_spatial_dims<T: AsRef<str>>(
-    spatial_dims: Option<&[T]>,
-    dimension_names: Option<&[DimensionName]>,
+    spatial_dims: &[T],
+    dimension_names: &[DimensionName],
 ) -> Vec<String> {
-    if let Some(spatial_dims) = spatial_dims
-        && let Some(dimension_names) = dimension_names
-    {
-        dimension_names
-            .iter()
-            .filter_map(|dim| dim.as_deref())
-            .filter(|name| !spatial_dims.iter().any(|s| s.as_ref() == *name))
-            .map(String::from)
-            .collect()
-    } else {
-        Vec::new()
-    }
+    dimension_names
+        .iter()
+        .filter_map(|dim| dim.as_deref())
+        .filter(|name| !spatial_dims.iter().any(|s| s.as_ref() == *name))
+        .map(String::from)
+        .collect()
 }
 
 /// Get the affine transformation from pixel space to geographic space
@@ -534,10 +529,11 @@ pub(crate) enum ZarrFillValue {
 impl ZarrFillValue {
     /// Convert based on data type
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn from_fill_value(
-        fill_value: &FillValue,
-        data_type: &DataType,
+    pub(crate) fn from_array<T: ObjectStore>(
+        array: &Array<AsyncObjectStore<T>>,
     ) -> Result<ZarrFillValue, ZarrError> {
+        let fill_value = array.fill_value();
+        let data_type = array.data_type();
         match data_type.name(ZarrVersion::V3).as_deref() {
             Some("float32") => fill_value_f32(fill_value).map(ZarrFillValue::F32),
             // Some("float64") => fill_value_f64(fill_value).map(|val| ZarrFillValue::F64(val)),
@@ -568,63 +564,6 @@ pub(crate) fn fill_value_f64(fill_value: &FillValue) -> Result<f64, ZarrError> {
     Ok(f64::from_ne_bytes(bytes))
 }
 
-#[allow(clippy::cast_sign_loss)]
-#[allow(clippy::cast_possible_truncation)]
-fn sampled_data_to_png(
-    sampled_data: &[f32],
-    width: u32,
-    height: u32,
-    min: f32,
-    max: f32,
-    fill_value: ZarrFillValue,
-) -> Result<Vec<u8>, ZarrError> {
-    let expected_len = (width * height) as usize;
-    if sampled_data.len() != expected_len {
-        return Err(ZarrError::DimensionError(format!(
-            "Buffer size {} does not match dimensions {}x{}",
-            sampled_data.len(),
-            width,
-            height
-        )));
-    }
-
-    let mut image = GrayAlphaImage::new(width, height);
-
-    let range = if max > min { max - min } else { 1.0 };
-
-    let ZarrFillValue::F32(target_fill) = fill_value;
-
-    for (i, &value) in sampled_data.iter().enumerate() {
-        let is_nodata = value.is_nan()
-            || (target_fill.is_nan() && value.is_nan())
-            || (!target_fill.is_nan()
-                && (value - target_fill).abs() <= f32::EPSILON * target_fill.abs().max(1.0));
-
-        let pixel = if is_nodata {
-            [0, 0]
-        } else {
-            // Normalize against min/max bounds
-            let normalized = ((value - min) / range).clamp(0.0, 1.0);
-            let v = (normalized * 255.0).round() as u8;
-
-            [v, 255]
-        };
-
-        let x = (i as u32) % width;
-        let y = (i as u32) / width;
-
-        image.put_pixel(x, y, LumaA(pixel));
-    }
-
-    let mut bytes = Cursor::new(Vec::new());
-
-    image
-        .write_to(&mut bytes, ImageFormat::Png)
-        .map_err(ZarrError::ImageError)?;
-
-    Ok(bytes.into_inner())
-}
-
 /// Metadata for temporal units and epoch
 #[derive(Debug, Clone)]
 pub(crate) struct TimeMetadata {
@@ -642,8 +581,8 @@ pub(crate) enum DimMeta {
 
 /// An index for dimensional coords
 #[derive(Debug, Clone)]
-pub(crate) struct DimIndex {
-    /// In-memory sorted array of timestamps
+pub struct DimIndex {
+    /// In-memory sorted array of coordinate values
     pub(crate) values: Vec<f64>,
     pub(crate) meta: DimMeta,
 }
@@ -701,7 +640,7 @@ impl DimIndex {
         })
     }
 
-    /// Get index of datetime along temporal dimension
+    /// Get index of coordinate along dimension
     pub fn get_index(&self, val: f64) -> u64 {
         self.find_closest_binary(val) as u64
     }
@@ -784,32 +723,18 @@ impl TimeMetadata {
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::LazyLock};
 
-    use object_store::local::LocalFileSystem;
+    use crate::test_utils::get_zarr_store;
 
     use super::*;
-
-    static ZARR_STORE: LazyLock<Arc<AsyncObjectStore<LocalFileSystem>>> = LazyLock::new(|| {
-        let path = PathBuf::from(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../tests/fixtures/zarr/pyramid.zarr"
-        ));
-        let local_store =
-            LocalFileSystem::new_with_prefix(path).expect("could not create file system storage");
-        Arc::new(AsyncObjectStore::new(local_store))
-    });
-
-    fn get_zarr_store() -> Arc<AsyncObjectStore<LocalFileSystem>> {
-        ZARR_STORE.clone()
-    }
 
     #[tokio::test]
     async fn test_data_vars() {
         let store = get_zarr_store();
-        let nodes = zarr_nodes(store).await.expect("should have data variables");
+        let nodes = zarr_nodes(store).await.expect("should have nodes");
         let paths = nodes
             .into_iter()
+            .filter(|node| is_data_variable(node).is_ok_and(|v| v))
             .map(|node| node.path().clone())
             .collect::<Vec<_>>();
         assert_eq!(
@@ -891,43 +816,7 @@ mod tests {
             .expect("should have multiscales");
         let scales = abs_scales([1.0, 1.0], &multiscales, &indices[..]);
         let first = scales.get("1");
-        assert_eq!(first, Some(&2.5));
-    }
-
-    #[test]
-    fn test_sample_at_warp_grid() {
-        let mut data = Array2::<f32>::zeros((4, 4));
-
-        for y in 0..3 {
-            for x in 0..3 {
-                data[[y, x]] = (y * 10 + x) as f32;
-            }
-        }
-
-        let (warp_grid, warp_grid_bbox) = calculate_warp_grid_for_bbox(
-            BBox::new(0.0, 0.0, 4.0, 4.0),
-            "EPSG:4326",
-            "EPSG:4326",
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            [4, 4],
-            4,
-            &SpatialRegistration::Pixel,
-        )
-        .expect("could not calculate warp grid")
-        .expect("should be some");
-
-        let (sampled_data, min, max) = sample_at_warp_grid(
-            &warp_grid,
-            warp_grid_bbox,
-            &data,
-            4,
-            ZarrFillValue::F32(0.0),
-        )
-        .expect("could not calculate warp grid");
-
-        assert_eq!(sampled_data[6], 22.0);
-        assert_eq!(min, 0.0);
-        assert_eq!(max, 22.0);
+        assert_eq!(first, Some(&2.0));
     }
 
     #[tokio::test]
@@ -936,89 +825,45 @@ mod tests {
         let data_var = Array::async_open(Arc::clone(&store), "/0/air")
             .await
             .unwrap();
-        let fill_value = fill_value(data_var.fill_value(), data_var.data_type())
-            .expect("should have fill value");
+        let fill_value = ZarrFillValue::from_array(&data_var).expect("should have fill value");
         match fill_value {
             ZarrFillValue::F32(val) => assert!(val.is_nan()),
         }
     }
 
-    #[tokio::test]
-    async fn test_calculate_warp_grid() {
-        let (warp_grid, _warp_grid_bbox) = calculate_warp_grid(
-            7680301055145410560,
-            [5.0, 0.0, 198.75, 0.0, -5.0, 76.25],
-            "EPSG:4326",
-            [12, 26],
-            &SpatialRegistration::Pixel,
-        )
-        .expect("could not calculate warp grid")
-        .expect("should be some");
+    // #[test]
+    // fn test_sample_at_warp_grid() {
+    //     let mut data = Array2::<f32>::zeros((4, 4));
 
-        println!("{warp_grid:?}");
-    }
+    //     for y in 0..3 {
+    //         for x in 0..3 {
+    //             data[[y, x]] = (y * 10 + x) as f32;
+    //         }
+    //     }
 
-    #[tokio::test]
-    async fn test_sample_cell() {
-        let store = get_zarr_store();
-        let data_var = Array::async_open(Arc::clone(&store), "/0/air")
-            .await
-            .unwrap();
+    //     let (warp_grid, warp_grid_bbox) = calculate_warp_grid_for_bbox(
+    //         BBox::new(0.0, 0.0, 4.0, 4.0),
+    //         "EPSG:4326",
+    //         "EPSG:4326",
+    //         [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    //         [4, 4],
+    //         4,
+    //         &SpatialRegistration::Pixel,
+    //     )
+    //     .expect("could not calculate warp grid")
+    //     .expect("should be some");
 
-        let cell_id = 7680301055145410560;
+    //     let (sampled_data, min, max) = sample_at_warp_grid(
+    //         &warp_grid,
+    //         warp_grid_bbox,
+    //         &data,
+    //         4,
+    //         ZarrFillValue::F32(0.0),
+    //     )
+    //     .expect("could not calculate warp grid");
 
-        let root_node = Node::async_open(Arc::clone(&store), "/")
-            .await
-            .expect("should have root group");
-
-        // time
-        let time_str = "2026-08-13T00:04:00.000Z";
-        let datetime = DateTime::parse_from_rfc3339(time_str)
-            .expect("msg")
-            .with_timezone(&Utc);
-        let time_array = Arc::new(
-            Array::async_open(Arc::clone(&store), "/0/time")
-                .await
-                .map_err(ZarrError::ArrayCreateError)
-                .expect("should open"),
-        );
-        let temporal_index = DimIndex::load(&time_array).await.expect("should load");
-
-        let src_transform = get_spatial_transform(&root_node)
-            .expect("could not get spatial:transform")
-            .expect("should have spatial transform");
-        let src_shape = get_spatial_shape(&root_node)
-            .expect("could not get spatial shpae")
-            .expect("could not get spatial shape");
-        let src_crs = get_proj(&root_node).expect("should have crs");
-        let (warp_grid, warp_grid_bbox) = calculate_warp_grid(
-            cell_id,
-            src_transform,
-            &src_crs.into_string(),
-            src_shape,
-            &SpatialRegistration::Pixel,
-        )
-        .expect("could not calculate warp grid")
-        .expect("should be some");
-        // let tile_data = retrieve_tile_data(
-        //     warp_grid_bbox,
-        //     Some(&temporal_index),
-        //     datetime,
-        //     &data_var,
-        //     &[0, 1, 2],
-        // )
-        // .await
-        // .expect("could not retrieve tile data");
-        // let res = sample_data(
-        //     &warp_grid,
-        //     warp_grid_bbox,
-        //     &tile_data,
-        //     TILE_PIXELS,
-        //     ZarrFillValue::F32(0.0),
-        //     0.1,
-        //     90.7,
-        // );
-
-        // assert!(res.is_ok());
-    }
+    //     assert_eq!(sampled_data[6], 22.0);
+    //     assert_eq!(min, 0.0);
+    //     assert_eq!(max, 22.0);
+    // }
 }

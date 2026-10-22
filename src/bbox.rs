@@ -92,12 +92,9 @@ impl BBox {
 
 #[cfg(test)]
 mod tests {
-    use std::{error::Error, path::Path};
-
     use a5::{LonLat, lonlat_to_cell};
-    use csv::ReaderBuilder;
 
-    use crate::bbox::BBox;
+    use crate::{bbox::BBox, test_utils::read_cell_ids};
     const EPS: f64 = 1e-5;
 
     fn test_eq(bbox_a: &BBox, bbox_b: &BBox) -> bool {
@@ -105,18 +102,6 @@ mod tests {
             && (bbox_a.xmax - bbox_b.xmax).abs() < EPS
             && (bbox_a.ymin - bbox_b.ymin).abs() < EPS
             && (bbox_a.ymax - bbox_b.ymax).abs() < EPS
-    }
-
-    fn read_cell_ids<P: AsRef<Path>>(path: P) -> Result<Vec<u64>, Box<dyn Error>> {
-        let mut rdr = ReaderBuilder::new().has_headers(false).from_path(path)?;
-
-        // Deserialize each row into a single-element tuple (u64,)
-        let cell_ids: Result<Vec<u64>, _> = rdr
-            .deserialize::<(u64,)>()
-            .map(|res| res.map(|row| row.0))
-            .collect();
-
-        Ok(cell_ids?)
     }
 
     #[test]

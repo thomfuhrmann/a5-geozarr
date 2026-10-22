@@ -914,9 +914,11 @@ name = "geozarr-client"
 version = "0.1.0"
 dependencies = [
  "a5",
+ "bytemuck",
  "chrono",
  "csv",
  "image",
+ "inventory",
  "ndarray",
  "object_store",
  "proj",
@@ -927,8 +929,10 @@ dependencies = [
  "tilejson",
  "tokio",
  "url",
+ "zarr-cast-value",
  "zarrs",
  "zarrs_object_store",
+ "zarrs_plugin",
 ]
 
 [[package]]
@@ -3574,6 +3578,18 @@ dependencies = [
  "quote",
  "syn 3.0.9",
  "synstructure",
+]
+
+[[package]]
+name = "zarr-cast-value"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e395a177739bf518579a19cc12aa705bfa4d1c831f3a4cce13222b5ca0438248"
+dependencies = [
+ "num-traits",
+ "pulp",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]
