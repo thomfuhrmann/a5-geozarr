@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, hash_map::Entry},
+    collections::{BTreeMap, HashMap},
     hash::Hasher,
     sync::Arc,
 };
@@ -16,18 +16,31 @@ use zarrs::{
     node::{Node, NodePath},
     plugin::ZarrVersion,
 };
+use zarrs_icechunk::{
+    AsyncIcechunkStore,
+    icechunk::{
+        self, Repository, RepositoryConfig, repository::VersionInfo,
+        virtual_chunks::VirtualChunkContainer,
+    },
+};
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::{
+    dimension::{DimCoords, DimMeta},
     error::ZarrError,
     geozarr::{
-        DimIndex, DimMeta, Multiscales, SpatialRegistration, ZarrFillValue,
-        calculate_resolution_levels, get_bbox, get_multiscales, get_non_spatial_dims, get_proj,
-        get_spatial_dims, get_spatial_dims_indices, get_spatial_registration, get_spatial_shape,
-        get_spatial_transform, native_cell_res, select_best_level, zarr_nodes,
+        GeozarrMetadata, ZarrFillValue, calculate_resolution_levels, get_non_spatial_dims,
+        get_proj, get_spatial_dims, get_spatial_dims_indices, native_cell_res, select_best_level,
+        zarr_nodes,
     },
     warp_grid::{TARGET_CRS, WarpGrid},
 };
+
+#[derive(Debug, Clone)]
+pub enum StoreType {
+    Zarr,
+    Icechunk,
+}
 
 /// Key on spatial:crs and spatial:transform
 #[derive(Debug, Clone)]
@@ -61,21 +74,67 @@ pub struct QueryCoords {
     other_dims: HashMap<String, f64>,
 }
 
+pub struct QueryCoordsBuilder {
+    temporal_dims: HashMap<String, DateTime<Utc>>,
+    other_dims: HashMap<String, f64>,
+}
+
+impl QueryCoordsBuilder {
+    pub fn new() -> Self {
+        Self {
+            temporal_dims: HashMap::new(),
+            other_dims: HashMap::new(),
+        }
+    }
+
+    pub fn temporal_dim<S: Into<String>>(mut self, name: S, dt: DateTime<Utc>) -> Self {
+        self.temporal_dims.insert(name.into(), dt);
+        self
+    }
+
+    pub fn temporal_dim_str<S1: Into<String>, S2: Into<String>>(
+        mut self,
+        name: S1,
+        rfc3339: S2,
+    ) -> Result<Self, chrono::ParseError> {
+        let dt = DateTime::parse_from_rfc3339(&rfc3339.into())?.with_timezone(&Utc);
+        self.temporal_dims.insert(name.into(), dt);
+        Ok(self)
+    }
+
+    pub fn other_dim<S1: Into<String>, S2: Into<f64>>(mut self, key: S1, value: S2) -> Self {
+        self.other_dims.insert(key.into(), value.into());
+        self
+    }
+
+    pub fn build(self) -> QueryCoords {
+        QueryCoords {
+            temporal_dims: self.temporal_dims,
+            other_dims: self.other_dims,
+        }
+    }
+}
+
+impl Default for QueryCoordsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct GeoZarrClient {
     /// One warp grid per spatial crs and spatial transform
     pub warp_grids: HashMap<WarpCacheKey, WarpGrid>,
+    /// Registry for object stores used by the client
     pub object_store_registry: HashMap<Url, Arc<dyn ObjectStore>>,
 }
 
 impl GeoZarrClient {
     pub fn new() -> Self {
-        GeoZarrClient {
-            warp_grids: HashMap::new(),
-            object_store_registry: HashMap::new(),
-        }
+        Self::default()
     }
 
-    pub fn build_store_from_url(url: &Url) -> Result<Arc<dyn ObjectStore>, Error> {
+    pub fn build_object_store(url: &Url) -> Result<Arc<dyn ObjectStore>, Error> {
         match url.scheme() {
             "file" => {
                 let path = url
@@ -119,8 +178,8 @@ impl GeoZarrClient {
         match self.object_store_registry.get(url) {
             Some(s) => Ok(s.clone()),
             None => {
-                let new_store = GeoZarrClient::build_store_from_url(url)
-                    .map_err(ZarrError::OjbectStoreError)?;
+                let new_store =
+                    GeoZarrClient::build_object_store(url).map_err(ZarrError::OjbectStoreError)?;
                 self.object_store_registry
                     .insert(url.clone(), new_store.clone());
                 Ok(new_store)
@@ -128,17 +187,85 @@ impl GeoZarrClient {
         }
     }
 
+    pub async fn build_icechunk_store(
+        url: &Url,
+        virtual_chunks_url: &Url,
+    ) -> Result<Arc<AsyncIcechunkStore>, ZarrError> {
+        let storage = match url.scheme() {
+            "file" => {
+                let path = url.to_file_path().map_err(|_| {
+                    ZarrError::OjbectStoreError(Error::Generic {
+                        store: "LocalFileSystem",
+                        source: "Invalid file URL path".into(),
+                    })
+                })?;
+                icechunk::new_local_filesystem_storage(&path)
+                    .await
+                    .map_err(ZarrError::IcechunkStorageError)?
+            }
+            "http" | "https" => {
+                // HttpBuilder expects the base URL (typically origin + path prefix)
+                todo!()
+            }
+            "s3" | "s3a" => {
+                todo!()
+            }
+            "gs" => {
+                todo!()
+            }
+            "az" | "abfs" | "abfss" => {
+                todo!()
+            }
+            scheme => Err(ZarrError::OjbectStoreError(Error::Generic {
+                store: "ObjectStoreRegistry",
+                source: format!("Unsupported URL scheme: {scheme}").into(),
+            }))?,
+        };
+
+        let container = VirtualChunkContainer::new(
+            virtual_chunks_url.to_string(),
+            icechunk::ObjectStoreConfig::Http(Default::default()),
+        )
+        .map_err(ZarrError::VirtualChunkError)?;
+
+        let mut config = RepositoryConfig::default();
+        config
+            .set_virtual_chunk_container(container)
+            .map_err(ZarrError::VirtualChunkError)?;
+
+        let repo = Repository::open(storage)
+            .config(config)
+            .authorize_virtual_chunk_access(HashMap::from([(virtual_chunks_url.to_string(), None)]))
+            .execute()
+            .await
+            .map_err(ZarrError::IcechunkRepositoryError)?;
+
+        let session = repo
+            .readonly_session(&VersionInfo::BranchTipRef("main".to_string()))
+            .await
+            .map_err(ZarrError::IcechunkRepositoryError)?;
+
+        let store = Arc::new(AsyncIcechunkStore::new(session));
+        Ok(store)
+    }
+
     // Retrieve coordinates from dimension arrays
     pub async fn load_dim_coords<T: ObjectStore>(
         zarr_store: Arc<AsyncObjectStore<T>>,
         root_path: &NodePath,
-        multiscales: Option<&Multiscales>,
-        spatial_dims: &[String],
+        metadata: &GeozarrMetadata,
         dimension_names: &[Option<String>],
-    ) -> Result<HashMap<NodePath, DimIndex>, ZarrError> {
+    ) -> Result<HashMap<NodePath, DimCoords>, ZarrError> {
+        let spatial_dims =
+            metadata
+                .spatial_dims
+                .as_ref()
+                .ok_or(ZarrError::GeoZarrMetadataError(
+                    "Missing sptial:dimensions".into(),
+                ))?;
         let non_spatial_dims = get_non_spatial_dims(spatial_dims, dimension_names);
         let mut dims_index = HashMap::new();
-        if let Some(multiscales) = &multiscales {
+        if let Some(multiscales) = &metadata.multiscales {
             for layout_item in &multiscales.layout {
                 for dim in &non_spatial_dims {
                     let asset_path = root_path
@@ -148,7 +275,7 @@ impl GeoZarrClient {
                     let array = Array::async_open(Arc::clone(&zarr_store), path.as_str())
                         .await
                         .map_err(ZarrError::ArrayCreateError)?;
-                    let index = DimIndex::load(&array).await?;
+                    let index = DimCoords::load(&array).await?;
                     dims_index.insert(path, index);
                 }
             }
@@ -158,7 +285,7 @@ impl GeoZarrClient {
                 let array = Array::async_open(Arc::clone(&zarr_store), path.as_str())
                     .await
                     .map_err(ZarrError::ArrayCreateError)?;
-                let index = DimIndex::load(&array).await?;
+                let index = DimCoords::load(&array).await?;
                 dims_index.insert(path, index);
             }
         }
@@ -169,7 +296,7 @@ impl GeoZarrClient {
     pub fn get_dim_indices(
         query_coords: &QueryCoords,
         asset_path: &NodePath,
-        dims_index: &HashMap<NodePath, DimIndex>,
+        dim_coords: &HashMap<NodePath, DimCoords>,
         dimension_names: &[Option<String>],
     ) -> Result<HashMap<String, u64>, ZarrError> {
         let mut dim_indices = HashMap::new();
@@ -178,9 +305,9 @@ impl GeoZarrClient {
             let dim_path = asset_path
                 .join(dim_name)
                 .map_err(ZarrError::NodePathError)?;
-            if let Some((_, index)) = dims_index.iter().find(|(path, _)| **path == dim_path) {
+            if let Some((_, index)) = dim_coords.iter().find(|(path, _)| **path == dim_path) {
                 let DimMeta::Time(meta) = &index.meta;
-                let val = meta.datetime_to_raw(&val);
+                let val = meta.datetime_to_raw(val);
                 let coord = index.get_index(val);
                 dim_indices.insert(dim_name.clone(), coord);
             }
@@ -190,7 +317,7 @@ impl GeoZarrClient {
             let dim_path = asset_path
                 .join(dim_name)
                 .map_err(ZarrError::NodePathError)?;
-            if let Some((_, index)) = dims_index.iter().find(|(path, _)| **path == dim_path) {
+            if let Some((_, index)) = dim_coords.iter().find(|(path, _)| **path == dim_path) {
                 let coord = index.get_index(*val);
                 dim_indices.insert(dim_name.clone(), coord);
             }
@@ -209,10 +336,11 @@ impl GeoZarrClient {
     /// Retrieve data for given cells
     pub async fn fetch_data(
         &mut self,
-        cell_ids: &[u64],
         url: &Url,
+        cell_ids: &[u64],
         data_var_name: &str,
         query_coords: &QueryCoords,
+        _store_type: StoreType,
     ) -> Result<Option<(Box<[f32]>, f32, f32)>, ZarrError> {
         if cell_ids.is_empty() {
             return Err(ZarrError::ParameterError(
@@ -229,27 +357,13 @@ impl GeoZarrClient {
         let nodes = zarr_nodes(Arc::clone(&zarr_store)).await?;
 
         // Get spatial metadata
-        let multiscales = get_multiscales(&root_node)?;
-        let spatial_crs = get_proj(&root_node);
-        let spatial_dims = get_spatial_dims(&root_node)?;
-        let spatial_bbox = get_bbox(&root_node)?;
-        let spatial_shape = get_spatial_shape(&root_node)?;
-        let spatial_transform = get_spatial_transform(&root_node)?;
-        let spatial_registration =
-            get_spatial_registration(&root_node).unwrap_or(SpatialRegistration::default());
+        let mut geozarr_metadata = GeozarrMetadata::from_node(&root_node)?;
 
         // Calculate absolute scales and corresponding layout items for multiscales
-        let resolutions = calculate_resolution_levels(
-            &root_node,
-            &nodes,
-            data_var_name,
-            multiscales.as_ref(),
-            spatial_dims.as_deref(),
-            spatial_shape.as_ref(),
-            spatial_bbox.as_ref(),
-            spatial_transform.as_ref(),
-        )?;
+        let resolutions =
+            calculate_resolution_levels(&root_node, &nodes, data_var_name, &geozarr_metadata)?;
 
+        // Take projection metadata from first resolution level
         let spatial_crs = if let Some(res) = resolutions
             .as_ref()
             .filter(|r| !r.is_empty())
@@ -259,60 +373,54 @@ impl GeoZarrClient {
                 .path()
                 .join(&res.item.asset)
                 .map_err(ZarrError::NodePathError)?;
-
             nodes
                 .iter()
                 .find(|node| node.path() == &path)
                 .and_then(get_proj)
                 .map(|scrs| scrs.into_string())
         } else {
-            spatial_crs.map(|proj| proj.into_string())
+            geozarr_metadata.proj.clone().map(|proj| proj.into_string())
         };
-
         let crs_str =
             spatial_crs.ok_or_else(|| ZarrError::AttributeError("Missing projection".into()))?;
 
         // calculate cell resolution in source crs
         let cell_res = native_cell_res(cell_ids[0], TARGET_CRS, &crs_str)?;
 
-        // find best matching resolution
-        let level_item = resolutions
+        // find best matching resolution and update GeoZarr metadata
+        let layout_item = resolutions
             .as_ref()
             .and_then(|res_list| select_best_level(cell_res, res_list).transpose())
             .transpose()?;
+        if layout_item
+            .is_some_and(|item| item.spatial_shape.is_some() && item.spatial_transform.is_some())
+        {
+            geozarr_metadata = geozarr_metadata
+                .with_spatial_shape(layout_item.and_then(|item| item.spatial_shape))
+                .with_spatial_transform(layout_item.and_then(|item| item.spatial_transform));
+        }
 
-        let spatial_transform = level_item
-            .and_then(|item| item.spatial_transform)
-            .or(spatial_transform)
+        // need spatial transform for warp cache key
+        let spatial_transform = geozarr_metadata
+            .spatial_transform
             .ok_or_else(|| ZarrError::AttributeError("Missing spatial:transform".into()))?;
-
-        let spatial_shape = level_item
-            .and_then(|item| item.spatial_shape)
-            .or(spatial_shape)
-            .ok_or_else(|| ZarrError::AttributeError("Missing spatial:shape".into()))?;
 
         // calculate warp grid
         let key = WarpCacheKey(crs_str.clone(), spatial_transform);
         if !self.warp_grids.contains_key(&key) {
-            let calculated = WarpGrid::calculate_warp_grid(
-                cell_ids,
-                &crs_str,
-                spatial_shape,
-                spatial_transform,
-                &spatial_registration,
-            )?;
+            let calculated = WarpGrid::calculate_warp_grid(cell_ids, &geozarr_metadata)?;
 
             self.warp_grids.insert(key.clone(), calculated);
         }
         let warp_grid = self.warp_grids.get(&key).unwrap();
 
-        // return empty box if outside the data space
+        // return empty box if outside the data grid
         let Some(bbox) = warp_grid.grid_bbox else {
             return Ok(None);
         };
 
-        // retrieve relative path to asset
-        let asset_suffix = level_item
+        // retrieve relative path to asset and open array
+        let asset_suffix = layout_item
             .map(|item| item.asset.trim_matches('/'))
             .unwrap_or_else(|| "");
         let asset_path = root_node
@@ -332,26 +440,11 @@ impl GeoZarrClient {
             .as_ref()
             .ok_or_else(|| ZarrError::DimensionError("Missing dimension_names".into()))?;
 
-        let spatial_dims = match spatial_dims {
-            Some(dims) => dims,
-            None => {
-                let node = nodes
-                    .iter()
-                    .find(|node| node.path() == &array_path)
-                    .ok_or_else(|| ZarrError::NodeError("Missing node".into()))?;
-
-                get_spatial_dims(node)
-                    .map_err(|_| ZarrError::NodeError("Missing node".into()))?
-                    .ok_or_else(|| ZarrError::NodeError("Missing node".into()))?
-            }
-        };
-
         // load coordinates of non-spatial dimensions
         let dim_coords = Self::load_dim_coords(
             zarr_store,
-            &root_node.path(),
-            multiscales.as_ref(),
-            &spatial_dims,
+            root_node.path(),
+            &geozarr_metadata,
             dimension_names,
         )
         .await?;
@@ -360,8 +453,22 @@ impl GeoZarrClient {
         let dim_indices =
             Self::get_dim_indices(query_coords, &asset_path, &dim_coords, dimension_names)?;
 
+        let spatial_dims = match &geozarr_metadata.spatial_dims {
+            Some(dims) => dims,
+            None => {
+                let node = nodes
+                    .iter()
+                    .find(|node| node.path() == &array_path)
+                    .ok_or_else(|| ZarrError::NodeError("Missing node".into()))?;
+
+                &get_spatial_dims(node)
+                    .map_err(|_| ZarrError::NodeError("Missing node".into()))?
+                    .ok_or_else(|| ZarrError::NodeError("Missing node".into()))?
+            }
+        };
+
         let data = self
-            .retrieve_array_subset(&array, bbox, dimension_names, &spatial_dims, &dim_indices)
+            .retrieve_array_subset(&array, bbox, dimension_names, spatial_dims, &dim_indices)
             .await?;
 
         let fill_value = ZarrFillValue::from_array(&array)?;
@@ -417,7 +524,7 @@ impl GeoZarrClient {
             _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
         };
 
-        let spatial_indices = get_spatial_dims_indices(&spatial_dims, dimension_names)?;
+        let spatial_indices = get_spatial_dims_indices(spatial_dims, dimension_names)?;
         let mut squeezed = full_subset;
         for (idx, _) in dimension_names.iter().enumerate() {
             // remove non-spatial axis
@@ -466,7 +573,7 @@ impl GeoZarrClient {
         };
 
         for (idx, cell_id) in cell_ids.iter().enumerate() {
-            if let Some(&(right, down)) = grid.get(&cell_id) {
+            if let Some(&(right, down)) = grid.get(cell_id) {
                 if right == -1 || down == -1 {
                     continue;
                 }
@@ -503,7 +610,10 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::test_utils::{get_zarr_store, read_cell_ids};
+    use crate::{
+        geozarr::{SpatialRegistration, get_multiscales, get_spatial_registration},
+        test_utils::{get_path, get_zarr_store, read_cell_ids},
+    };
 
     #[tokio::test]
     async fn test_load_dim_coords() {
@@ -551,11 +661,13 @@ mod tests {
                     .expect("should have vec")
             }
         };
+        let metadata = GeozarrMetadata::new()
+            .with_multiscales(multiscales)
+            .with_spatial_dims(Some(spatial_dims));
         let dim_coords = GeoZarrClient::load_dim_coords(
             zarr_store,
             &root_node.path(),
-            multiscales.as_ref(),
-            &spatial_dims,
+            &metadata,
             dimension_names,
         )
         .await
@@ -568,67 +680,40 @@ mod tests {
 
     // 2014-12-31T12:00:00Z, 2014-12-31T18:00:00Z
     #[tokio::test]
-    async fn test_fetch() {
-        let cells =
-            read_cell_ids(Path::new("tests/fixtures/pyramid_cells.csv")).expect("should load");
-        let client = GeoZarrClient::new();
-        client.fetch_data(
-            cells,
-            r"C:\\Users\\fuhtho\\Rust\\tests\\fixtures\\pyramid.zarr",
-            data_var_name,
-            query_coords,
-        )
+    async fn test_fetch_1() {
+        let mut client = GeoZarrClient::new();
+        let cells = read_cell_ids(Path::new("tests/fixtures/pyramid_cells.csv"))
+            .expect("should load cell ids");
+        let path = get_path("tests/fixtures/pyramid.zarr");
+        let url = Url::from_file_path(path).expect("should have url");
+        let query_coords = QueryCoordsBuilder::new()
+            .temporal_dim_str("time", "2014-12-31T12:00:00Z")
+            .expect("should parse")
+            .build();
+        let data = client
+            .fetch_data(&url, &cells, "air", &query_coords, StoreType::Zarr)
+            .await
+            .expect("should fetch")
+            .expect("should have data");
+        assert_eq!(data.0.len(), cells.len());
     }
 
-    // let cell_id = 7680301055145410560;
-
-    // // time
-    // let time_str = "2026-08-13T00:04:00.000Z";
-    // let datetime = DateTime::parse_from_rfc3339(time_str)
-    //     .expect("msg")
-    //     .with_timezone(&Utc);
-    // let time_array = Arc::new(
-    //     Array::async_open(Arc::clone(&store), "/0/time")
-    //         .await
-    //         .map_err(ZarrError::ArrayCreateError)
-    //         .expect("should open"),
-    // );
-    // let temporal_index = DimIndex::load(&time_array).await.expect("should load");
-
-    // let src_transform = get_spatial_transform(&root_node)
-    //     .expect("could not get spatial:transform")
-    //     .expect("should have spatial transform");
-    // let src_shape = get_spatial_shape(&root_node)
-    //     .expect("could not get spatial shpae")
-    //     .expect("could not get spatial shape");
-    // let src_crs = get_proj(&root_node).expect("should have crs");
-    // let (warp_grid, warp_grid_bbox) = calculate_warp_grid(
-    //     cell_id,
-    //     src_transform,
-    //     &src_crs.into_string(),
-    //     src_shape,
-    //     &SpatialRegistration::Pixel,
-    // )
-    // .expect("could not calculate warp grid")
-    // .expect("should be some");
-    // let tile_data = retrieve_tile_data(
-    //     warp_grid_bbox,
-    //     Some(&temporal_index),
-    //     datetime,
-    //     &data_var,
-    //     &[0, 1, 2],
-    // )
-    // .await
-    // .expect("could not retrieve tile data");
-    // let res = sample_data(
-    //     &warp_grid,
-    //     warp_grid_bbox,
-    //     &tile_data,
-    //     TILE_PIXELS,
-    //     ZarrFillValue::F32(0.0),
-    //     0.1,
-    //     90.7,
-    // );
-
-    // assert!(res.is_ok());
+    #[tokio::test]
+    async fn test_fetch_2() {
+        let mut client = GeoZarrClient::new();
+        let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
+            .expect("should load cell ids");
+        let path = get_path("tests/fixtures/snowgrid.zarr");
+        let url = Url::from_file_path(path).expect("should have url");
+        let query_coords = QueryCoordsBuilder::new()
+            .temporal_dim_str("time", "2014-12-31T12:00:00Z")
+            .expect("should parse")
+            .build();
+        let data = client
+            .fetch_data(&url, &cells, "liquid_water", &query_coords, StoreType::Zarr)
+            .await
+            .expect("should fetch")
+            .expect("should have data");
+        assert_eq!(data.0.len(), cells.len());
+    }
 }

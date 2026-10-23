@@ -1,4 +1,8 @@
-use std::{error::Error, path::Path, sync::Arc};
+use std::{
+    error::Error,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use csv::ReaderBuilder;
 use std::sync::LazyLock;
@@ -18,13 +22,15 @@ pub(crate) fn read_cell_ids<P: AsRef<Path>>(path: P) -> Result<Vec<u64>, Box<dyn
     Ok(cell_ids?)
 }
 
+pub(crate) fn get_path(relative: &str) -> PathBuf {
+    let fixture_path = Path::new(relative).canonicalize().expect("should work");
+    let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_path.join(fixture_path)
+}
+
 pub(crate) static ZARR_STORE: LazyLock<Arc<AsyncObjectStore<LocalFileSystem>>> =
     LazyLock::new(|| {
-        let fixture_path = Path::new("tests/fixtures/pyramid.zarr")
-            .canonicalize()
-            .expect("should work");
-        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let path = manifest_path.join(fixture_path);
+        let path = get_path("tests/fixtures/pyramid.zarr");
         let local_store =
             LocalFileSystem::new_with_prefix(path).expect("could not create file system storage");
         Arc::new(AsyncObjectStore::new(local_store))

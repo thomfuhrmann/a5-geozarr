@@ -56,8 +56,8 @@ impl CastValueCodec {
         let data_type = DataType::from_metadata(&metadata).expect("Should work");
         Self {
             data_type,
-            rounding: configuration.rounding.clone(),
-            out_of_range: configuration.out_of_range.clone(),
+            rounding: configuration.rounding,
+            out_of_range: configuration.out_of_range,
             scalar_map: configuration.scalar_map.clone(),
         }
     }
@@ -77,19 +77,18 @@ impl CodecTraits for CastValueCodec {
         _version: ZarrVersion,
         _options: &CodecMetadataOptions,
     ) -> Option<Configuration> {
-        if let Some(data_type) = self.data_type.name_v3().map(|val| val.to_string()) {
-            Some(
+        self.data_type
+            .name_v3()
+            .map(|val| val.to_string())
+            .map(|data_type| {
                 CastValueConfig {
                     data_type,
-                    rounding: self.rounding.clone(),
-                    out_of_range: self.out_of_range.clone(),
+                    rounding: self.rounding,
+                    out_of_range: self.out_of_range,
                     scalar_map: self.scalar_map.clone(),
                 }
-                .into(),
-            )
-        } else {
-            None
-        }
+                .into()
+            })
     }
 
     /// Return the partial decoder capability of the codec
@@ -171,10 +170,10 @@ impl ArrayToArrayCodecTraits for CastValueCodec {
                     rounding: self.rounding.unwrap_or(RoundingMode::NearestEven),
                     out_of_range: self.out_of_range,
                 };
-                convert_slice_float_to_int(&raw_bytes, &mut enc_bytes, &config)
+                convert_slice_float_to_int(raw_bytes, &mut enc_bytes, &config)
                     .map_err(|e| CodecError::Other(e.to_string()))?;
                 let byte_vec: Vec<u8> = bytemuck::pod_collect_to_vec(&enc_bytes);
-                return Ok(ArrayBytes::from(byte_vec));
+                Ok(ArrayBytes::from(byte_vec))
             }
             (dec, enc)
                 if dec.downcast_ref::<Float64DataType>().is_some()
@@ -202,10 +201,10 @@ impl ArrayToArrayCodecTraits for CastValueCodec {
                     rounding: self.rounding.unwrap_or(RoundingMode::NearestEven),
                     out_of_range: self.out_of_range,
                 };
-                convert_slice_float_to_int(&raw_bytes, &mut enc_bytes, &config)
+                convert_slice_float_to_int(raw_bytes, &mut enc_bytes, &config)
                     .map_err(|e| CodecError::Other(e.to_string()))?;
                 let byte_vec: Vec<u8> = bytemuck::pod_collect_to_vec(&enc_bytes);
-                return Ok(ArrayBytes::from(byte_vec));
+                Ok(ArrayBytes::from(byte_vec))
             }
             _ => todo!(),
         }
@@ -249,10 +248,10 @@ impl ArrayToArrayCodecTraits for CastValueCodec {
                     map_entries,
                     rounding: self.rounding.unwrap_or(RoundingMode::NearestEven),
                 };
-                convert_slice_int_to_float(&raw_bytes, &mut decoded_bytes, &config)
+                convert_slice_int_to_float(raw_bytes, &mut decoded_bytes, &config)
                     .map_err(|e| CodecError::Other(e.to_string()))?;
                 let byte_vec: Vec<u8> = bytemuck::pod_collect_to_vec(&decoded_bytes);
-                return Ok(ArrayBytes::from(byte_vec));
+                Ok(ArrayBytes::from(byte_vec))
             }
             (enc, dec)
                 if enc.downcast_ref::<UInt16DataType>().is_some()
@@ -279,10 +278,10 @@ impl ArrayToArrayCodecTraits for CastValueCodec {
                     map_entries,
                     rounding: self.rounding.unwrap_or(RoundingMode::NearestEven),
                 };
-                convert_slice_int_to_float(&raw_bytes, &mut decoded_bytes, &config)
+                convert_slice_int_to_float(raw_bytes, &mut decoded_bytes, &config)
                     .map_err(|e| CodecError::Other(e.to_string()))?;
                 let byte_vec: Vec<u8> = bytemuck::pod_collect_to_vec(&decoded_bytes);
-                return Ok(ArrayBytes::from(byte_vec));
+                Ok(ArrayBytes::from(byte_vec))
             }
             _ => unimplemented!("Data types not supported yet"),
         }

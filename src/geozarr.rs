@@ -1,12 +1,9 @@
-use chrono::{DateTime, NaiveDate, TimeZone as _, Utc};
 use core::f64;
-use image::{GrayAlphaImage, ImageFormat, LumaA};
 use object_store::ObjectStore;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::io::Cursor;
 use std::sync::Arc;
-use zarrs::array::{DataType, FillValue};
+use zarrs::array::FillValue;
 use zarrs::group::GroupMetadata;
 use zarrs::{
     array::{Array, ArrayMetadata, DimensionName},
@@ -52,7 +49,7 @@ pub struct Transform {
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
-pub(crate) enum Proj {
+pub enum Proj {
     Code(String),
     Wkt2(String),
     Projjson(Value),
@@ -110,6 +107,85 @@ pub(crate) fn native_cell_res(
     Ok(res_per_pixel)
 }
 
+#[derive(Debug, Default)]
+pub struct GeozarrMetadata {
+    pub multiscales: Option<Multiscales>,
+    pub proj: Option<Proj>,
+    pub spatial_dims: Option<Vec<String>>,
+    pub spatial_shape: Option<[u64; 2]>,
+    pub spatial_bbox: Option<[f64; 4]>,
+    pub spatial_transform: Option<[f64; 6]>,
+    pub spatial_registration: SpatialRegistration,
+}
+
+impl GeozarrMetadata {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn with_multiscales(mut self, multiscales: Option<Multiscales>) -> Self {
+        self.multiscales = multiscales;
+        self
+    }
+
+    pub fn with_proj(mut self, proj: Option<Proj>) -> Self {
+        self.proj = proj;
+        self
+    }
+
+    pub fn with_spatial_dims(mut self, spatial_dims: Option<Vec<String>>) -> Self {
+        self.spatial_dims = spatial_dims;
+        self
+    }
+
+    pub fn with_spatial_shape(mut self, spatial_shape: Option<[u64; 2]>) -> Self {
+        self.spatial_shape = spatial_shape;
+        self
+    }
+
+    pub fn with_spatial_bbox(mut self, spatial_bbox: Option<[f64; 4]>) -> Self {
+        self.spatial_bbox = spatial_bbox;
+        self
+    }
+
+    pub fn with_spatial_transform(mut self, spatial_transform: Option<[f64; 6]>) -> Self {
+        self.spatial_transform = spatial_transform;
+        self
+    }
+
+    pub fn with_spatial_registration(mut self, spatial_registration: SpatialRegistration) -> Self {
+        self.spatial_registration = spatial_registration;
+        self
+    }
+
+    pub fn update_with_layout_item(&mut self, layout_item: Option<&LayoutItem>) {
+        self.spatial_transform = layout_item
+            .and_then(|item| item.spatial_transform)
+            .or(self.spatial_transform);
+
+        self.spatial_shape = layout_item
+            .and_then(|item| item.spatial_shape)
+            .or(self.spatial_shape);
+    }
+
+    pub fn from_node(node: &Node) -> Result<Self, ZarrError> {
+        let multiscales = get_multiscales(node)?;
+        let spatial_crs = get_proj(node);
+        let spatial_dims = get_spatial_dims(node)?;
+        let spatial_bbox = get_bbox(node)?;
+        let spatial_shape = get_spatial_shape(node)?;
+        let spatial_transform = get_spatial_transform(node)?;
+        let spatial_registration = get_spatial_registration(node).unwrap_or_default();
+        Ok(GeozarrMetadata::new()
+            .with_multiscales(multiscales)
+            .with_proj(spatial_crs)
+            .with_spatial_dims(spatial_dims)
+            .with_spatial_bbox(spatial_bbox)
+            .with_spatial_shape(spatial_shape)
+            .with_spatial_transform(spatial_transform)
+            .with_spatial_registration(spatial_registration))
+    }
+}
+
 pub(crate) fn get_dimension_names(node: &Node) -> Option<&[Option<String>]> {
     match node.metadata() {
         NodeMetadata::Array(meta) => match meta {
@@ -125,13 +201,9 @@ pub(crate) fn calculate_resolution_levels(
     root_node: &Node,
     nodes: &[Node],
     data_var_name: &str,
-    multiscales: Option<&Multiscales>,
-    spatial_dims: Option<&[String]>,
-    spatial_shape: Option<&[u64; 2]>,
-    spatial_bbox: Option<&[f64; 4]>,
-    spatial_transform: Option<&[f64; 6]>,
+    geozarr_meta: &GeozarrMetadata,
 ) -> Result<Option<Vec<ResolutionLevel>>, ZarrError> {
-    let Some(multiscales) = multiscales else {
+    let Some(multiscales) = geozarr_meta.multiscales.as_ref() else {
         return Ok(None);
     };
 
@@ -162,14 +234,15 @@ pub(crate) fn calculate_resolution_levels(
             "Missing dimension_names metadata".into(),
         ));
     };
-    let spatial_dims = if let Some(spatial_dims) = spatial_dims {
+    let spatial_dims = if let Some(spatial_dims) = geozarr_meta.spatial_dims.as_ref() {
         spatial_dims
     } else {
         &get_spatial_dims(node)?.ok_or(ZarrError::AttributeError(
             "Missing spatial:dimensions".into(),
         ))?
     };
-    let spatial_transform = if let Some(spatial_transform) = spatial_transform {
+    let spatial_transform = if let Some(spatial_transform) = geozarr_meta.spatial_transform.as_ref()
+    {
         spatial_transform
     } else {
         &base_layout
@@ -178,7 +251,7 @@ pub(crate) fn calculate_resolution_levels(
                 "Missing spatial:transform".into(),
             ))?
     };
-    let spatial_shape = if let Some(spatial_shape) = spatial_shape {
+    let spatial_shape = if let Some(spatial_shape) = geozarr_meta.spatial_shape.as_ref() {
         spatial_shape
     } else {
         &base_layout
@@ -186,7 +259,7 @@ pub(crate) fn calculate_resolution_levels(
             .ok_or(ZarrError::AttributeError("Missing spatial:shape".into()))?
     };
 
-    let spatial_bbox = if let Some(spatial_bbox) = spatial_bbox {
+    let spatial_bbox = if let Some(spatial_bbox) = geozarr_meta.spatial_bbox.as_ref() {
         spatial_bbox
     } else {
         let xmin = spatial_transform[2];
@@ -225,7 +298,7 @@ pub(crate) fn calculate_resolution_levels(
 }
 
 /// Check if the array is a data variable
-pub(crate) fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
+pub fn is_data_variable(node: &Node) -> Result<bool, ZarrError> {
     let metadata = node.metadata();
     let path = node.path().as_str();
 
@@ -564,163 +637,6 @@ pub(crate) fn fill_value_f64(fill_value: &FillValue) -> Result<f64, ZarrError> {
     Ok(f64::from_ne_bytes(bytes))
 }
 
-/// Metadata for temporal units and epoch
-#[derive(Debug, Clone)]
-pub(crate) struct TimeMetadata {
-    pub(crate) units: String,
-    pub(crate) epoch: DateTime<Utc>,
-    #[allow(dead_code)]
-    pub(crate) calendar: String,
-}
-
-/// Metadata for dimensions
-#[derive(Debug, Clone)]
-pub(crate) enum DimMeta {
-    Time(TimeMetadata),
-}
-
-/// An index for dimensional coords
-#[derive(Debug, Clone)]
-pub struct DimIndex {
-    /// In-memory sorted array of coordinate values
-    pub(crate) values: Vec<f64>,
-    pub(crate) meta: DimMeta,
-}
-
-impl DimIndex {
-    #[allow(clippy::cast_lossless)]
-    #[allow(clippy::cast_precision_loss)]
-    pub async fn load<T: ObjectStore>(
-        coords: &Array<AsyncObjectStore<T>>,
-    ) -> Result<Self, ZarrError> {
-        let data_type = coords.data_type();
-        let name = data_type.name(ZarrVersion::V3);
-
-        let data = match name.as_deref() {
-            Some("int32") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<i32>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?
-                .mapv(|val| val as f64),
-            Some("int64") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<i64>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?
-                .mapv(|val| val as f64),
-            Some("float32") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<f32>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?
-                .mapv(f64::from),
-            Some("float64") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<f64>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?,
-            _ => return Err(ZarrError::DimensionError("Data type not supported".into())),
-        };
-
-        // Extract metadata
-        let attrs = coords.attributes();
-        let units = attrs
-            .get("units")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ZarrError::TimeError("Could not get time units".into()))?;
-
-        let calendar = attrs
-            .get("calendar")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ZarrError::TimeError("Could not get calendar metadata".into()))?;
-
-        let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
-        let (values, _offset) = data.into_raw_vec_and_offset();
-
-        Ok(Self {
-            values,
-            meta: DimMeta::Time(time_meta),
-        })
-    }
-
-    /// Get index of coordinate along dimension
-    pub fn get_index(&self, val: f64) -> u64 {
-        self.find_closest_binary(val) as u64
-    }
-
-    /// Binary search helper function
-    fn find_closest_binary(&self, target: f64) -> usize {
-        let array = &self.values;
-        match array.binary_search_by(|probe| {
-            probe
-                .partial_cmp(&target)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            Ok(index) => index,
-            Err(index) => {
-                // 'index' is the insertion point
-                if index == 0 {
-                    return 0;
-                }
-                if index >= array.len() {
-                    return array.len() - 1;
-                }
-
-                let diff_left = (target - array[index - 1]).abs();
-                let diff_right = (array[index] - target).abs();
-
-                if diff_left < diff_right {
-                    index - 1
-                } else {
-                    index
-                }
-            }
-        }
-    }
-}
-
-impl TimeMetadata {
-    fn parse_zarr_time_attrs(units: &str, calendar: &str) -> Result<Self, ZarrError> {
-        // split "seconds since 1970-01-01"
-        let parts: Vec<&str> = units.split(" since ").collect();
-        let unit_type = parts[0].to_lowercase();
-
-        // parse the date part
-        let epoch_date =
-            NaiveDate::parse_from_str(parts[1].split(' ').collect::<Vec<_>>()[0], "%Y-%m-%d")
-                .map_err(ZarrError::ChronoError)?;
-
-        // convert to UTC DateTime at midnight
-        let epoch_date_time = epoch_date.and_hms_opt(0, 0, 0).ok_or(ZarrError::TimeError(
-            "Can not convert to date time value".into(),
-        ))?;
-        let epoch = Utc.from_utc_datetime(&epoch_date_time);
-
-        Ok(Self {
-            units: unit_type,
-            epoch,
-            calendar: calendar.to_owned(),
-        })
-    }
-
-    #[allow(clippy::cast_precision_loss)]
-    pub(crate) fn datetime_to_raw(&self, val: &DateTime<Utc>) -> f64 {
-        let duration = val.signed_duration_since(self.epoch);
-        let secs = duration.num_seconds();
-        let nanos = i64::from(duration.subsec_nanos());
-
-        let total_seconds = secs + (nanos / 1_000_000_000);
-
-        let scale = match self.units.as_str() {
-            "days" => 1.0 / 86400.0,
-            "hours" => 1.0 / 3600.0,
-            "minutes" => 1.0 / 60.0,
-            "milliseconds" => 1000.0,
-            "microseconds" => 1_000_000.0,
-            _ => 1.0, // "seconds"
-        };
-
-        total_seconds as f64 * scale
-    }
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -830,40 +746,4 @@ mod tests {
             ZarrFillValue::F32(val) => assert!(val.is_nan()),
         }
     }
-
-    // #[test]
-    // fn test_sample_at_warp_grid() {
-    //     let mut data = Array2::<f32>::zeros((4, 4));
-
-    //     for y in 0..3 {
-    //         for x in 0..3 {
-    //             data[[y, x]] = (y * 10 + x) as f32;
-    //         }
-    //     }
-
-    //     let (warp_grid, warp_grid_bbox) = calculate_warp_grid_for_bbox(
-    //         BBox::new(0.0, 0.0, 4.0, 4.0),
-    //         "EPSG:4326",
-    //         "EPSG:4326",
-    //         [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-    //         [4, 4],
-    //         4,
-    //         &SpatialRegistration::Pixel,
-    //     )
-    //     .expect("could not calculate warp grid")
-    //     .expect("should be some");
-
-    //     let (sampled_data, min, max) = sample_at_warp_grid(
-    //         &warp_grid,
-    //         warp_grid_bbox,
-    //         &data,
-    //         4,
-    //         ZarrFillValue::F32(0.0),
-    //     )
-    //     .expect("could not calculate warp grid");
-
-    //     assert_eq!(sampled_data[6], 22.0);
-    //     assert_eq!(min, 0.0);
-    //     assert_eq!(max, 22.0);
-    // }
 }

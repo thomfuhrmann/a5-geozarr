@@ -3,6 +3,7 @@
 use std::{array::TryFromSliceError, num::ParseFloatError, path::PathBuf};
 
 use image::ImageError;
+use zarrs_icechunk::icechunk::{StorageError, repository::RepositoryError};
 
 /// Errors that can occur when working with Zarr stores
 #[non_exhaustive]
@@ -34,16 +35,16 @@ pub enum ZarrError {
     AttributeError(String),
     /// Chrono parse error
     #[error("Chrono parsing error: {0}")]
-    ChronoError(chrono::ParseError),
+    ChronoError(#[source] chrono::ParseError),
     /// Float parse error
     #[error("Float parsing error: {0}")]
-    ParseFloatError(ParseFloatError),
+    ParseFloatError(#[source] ParseFloatError),
     /// Projection creation error
     #[error("Projection create error: {0}")]
-    ProjCreateError(proj::ProjCreateError),
+    ProjCreateError(#[source] proj::ProjCreateError),
     /// Projection error
     #[error("Conversion error: {0}")]
-    ProjError(proj::ProjError),
+    ProjError(#[source] proj::ProjError),
     /// Time error
     #[error("Time attribute error: {0}")]
     TimeError(String),
@@ -52,7 +53,7 @@ pub enum ZarrError {
     DimensionError(String),
     /// Encode error
     #[error("Encode error: {0}")]
-    EncodeError(std::io::Error),
+    EncodeError(#[source] std::io::Error),
     /// Decode error
     #[error("Decode error: {0}")]
     DecodeError(String),
@@ -64,20 +65,35 @@ pub enum ZarrError {
     WarpError(String),
     /// Image error
     #[error("Image error: {0}")]
-    ImageError(ImageError),
+    ImageError(#[source] ImageError),
     /// Parameter error
     #[error("Parameter error: {0}")]
     ParameterError(String),
     /// Json parsing error
     #[error("Json error: {0}")]
-    JsonError(serde_json::Error),
+    JsonError(#[source] serde_json::Error),
     /// Fill value conversion error
     #[error("Fill value from slice error: {0}")]
-    FillValueError(TryFromSliceError),
+    FillValueError(#[source] TryFromSliceError),
+    /// Bounding box error
     #[error("Can not convert from cells to bounding box: {0}")]
     BoundingBoxError(u64),
+    /// Coordinate conversion error
     #[error("Can not convert from cell id to coordinates: {0}")]
     ConvertLonLatError(String),
+    /// Node path error
     #[error("Can not find node: {0}")]
     NodeError(String),
+    /// GeoZarr metadata error
+    #[error("Missing GeoZarr metadata element: {0}")]
+    GeoZarrMetadataError(String),
+    /// Icechunk storage error
+    #[error("Icechunk storage error: {0}")]
+    IcechunkStorageError(#[source] StorageError),
+    /// Icechunk repository error
+    #[error("Icechunk repository error: {0}")]
+    IcechunkRepositoryError(#[source] RepositoryError),
+    /// Icechunk virtual chunk container error
+    #[error("Virtual chunk error: {0}")]
+    VirtualChunkError(String),
 }
