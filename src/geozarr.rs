@@ -15,6 +15,7 @@ use zarrs_object_store::AsyncObjectStore;
 use serde::Deserialize;
 
 use crate::bbox::BBox;
+use crate::client::UnifiedAsyncStore;
 use crate::error::ZarrError;
 
 #[derive(Debug, Clone, Default)]
@@ -341,9 +342,7 @@ fn visit_nodes_recursive(node: &Node, nodes: &mut Vec<Node>) {
 }
 
 /// Retrieve all nodes
-pub(crate) async fn zarr_nodes<T: ObjectStore>(
-    store: Arc<AsyncObjectStore<T>>,
-) -> Result<Vec<Node>, ZarrError> {
+pub(crate) async fn zarr_nodes(store: Arc<UnifiedAsyncStore>) -> Result<Vec<Node>, ZarrError> {
     let mut nodes = Vec::new();
     let root_path = NodePath::root();
     let root_node = Node::async_open(Arc::clone(&store), root_path.as_str())
@@ -602,9 +601,7 @@ pub(crate) enum ZarrFillValue {
 impl ZarrFillValue {
     /// Convert based on data type
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn from_array<T: ObjectStore>(
-        array: &Array<AsyncObjectStore<T>>,
-    ) -> Result<ZarrFillValue, ZarrError> {
+    pub(crate) fn from_array(array: &Array<UnifiedAsyncStore>) -> Result<ZarrFillValue, ZarrError> {
         let fill_value = array.fill_value();
         let data_type = array.data_type();
         match data_type.name(ZarrVersion::V3).as_deref() {

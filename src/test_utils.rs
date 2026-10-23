@@ -10,6 +10,8 @@ use zarrs_object_store::AsyncObjectStore;
 
 use object_store::local::LocalFileSystem;
 
+use crate::client::UnifiedAsyncStore;
+
 pub(crate) fn read_cell_ids<P: AsRef<Path>>(path: P) -> Result<Vec<u64>, Box<dyn Error>> {
     let mut rdr = ReaderBuilder::new().has_headers(false).from_path(path)?;
 
@@ -28,14 +30,15 @@ pub(crate) fn get_path(relative: &str) -> PathBuf {
     manifest_path.join(fixture_path)
 }
 
-pub(crate) static ZARR_STORE: LazyLock<Arc<AsyncObjectStore<LocalFileSystem>>> =
-    LazyLock::new(|| {
-        let path = get_path("tests/fixtures/pyramid.zarr");
-        let local_store =
-            LocalFileSystem::new_with_prefix(path).expect("could not create file system storage");
-        Arc::new(AsyncObjectStore::new(local_store))
-    });
+pub(crate) static ZARR_STORE: LazyLock<Arc<UnifiedAsyncStore>> = LazyLock::new(|| {
+    let path = get_path("tests/fixtures/pyramid.zarr");
+    let local_store =
+        LocalFileSystem::new_with_prefix(path).expect("could not create file system storage");
+    Arc::new(crate::client::UnifiedAsyncStore::Zarr(
+        AsyncObjectStore::new(Arc::new(local_store)),
+    ))
+});
 
-pub(crate) fn get_zarr_store() -> Arc<AsyncObjectStore<LocalFileSystem>> {
+pub(crate) fn get_zarr_store() -> Arc<UnifiedAsyncStore> {
     ZARR_STORE.clone()
 }

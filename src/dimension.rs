@@ -1,10 +1,8 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use object_store::ObjectStore;
 use zarrs::array::Array;
-use zarrs_object_store::AsyncObjectStore;
 use zarrs_plugin::ZarrVersion;
 
-use crate::error::ZarrError;
+use crate::{client::UnifiedAsyncStore, error::ZarrError};
 
 /// Metadata for temporal units and epoch
 #[derive(Debug, Clone)]
@@ -32,9 +30,7 @@ pub struct DimCoords {
 impl DimCoords {
     #[allow(clippy::cast_lossless)]
     #[allow(clippy::cast_precision_loss)]
-    pub async fn load<T: ObjectStore>(
-        coords: &Array<AsyncObjectStore<T>>,
-    ) -> Result<Self, ZarrError> {
+    pub async fn load(coords: &Array<UnifiedAsyncStore>) -> Result<Self, ZarrError> {
         let data_type = coords.data_type();
         let name = data_type.name(ZarrVersion::V3);
 
