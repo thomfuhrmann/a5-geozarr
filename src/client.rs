@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     hash::Hasher,
-    pin::Pin,
     sync::Arc,
 };
 
@@ -16,11 +15,6 @@ use zarrs::{
     array::Array,
     node::{Node, NodePath},
     plugin::ZarrVersion,
-    storage::{
-        AsyncListableStorageTraits, AsyncMaybeBytesIterator, AsyncReadableStorageTraits,
-        MaybeBytes, StorageError, StoreKey, StoreKeys, StoreKeysPrefixes, StorePrefix,
-        byte_range::{ByteRange, ByteRangeIterator},
-    },
 };
 use zarrs_icechunk::{
     AsyncIcechunkStore,
@@ -39,6 +33,7 @@ use crate::{
         get_proj, get_spatial_dims, get_spatial_dims_indices, native_cell_res, select_best_level,
         zarr_nodes,
     },
+    store::ZarrStore,
     warp_grid::{TARGET_CRS, WarpGrid},
 };
 
@@ -127,124 +122,12 @@ impl Default for QueryCoordsBuilder {
     }
 }
 
-/// Wrapper enum for different types of zarr stores
-pub enum UnifiedAsyncStore {
-    Zarr(AsyncObjectStore<Arc<dyn ObjectStore>>),
-    Icechunk(AsyncIcechunkStore),
-}
-
-impl AsyncReadableStorageTraits for UnifiedAsyncStore {
-    fn get_partial_many<'a, 'life0, 'async_trait>(
-        &'a self,
-        key: &'life0 StoreKey,
-        byte_ranges: ByteRangeIterator<'a>,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<AsyncMaybeBytesIterator<'a>, StorageError>>
-                + Send
-                + 'async_trait,
-        >,
-    >
-    where
-        'a: 'async_trait,
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        match self {
-            UnifiedAsyncStore::Zarr(store) => store.get_partial_many(key, byte_ranges),
-            UnifiedAsyncStore::Icechunk(store) => store.get_partial_many(key, byte_ranges),
-        }
-    }
-
-    fn size_key<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        key: &'life1 StoreKey,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<u64>, StorageError>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        match self {
-            UnifiedAsyncStore::Zarr(store) => store.size_key(key),
-            UnifiedAsyncStore::Icechunk(store) => store.size_key(key),
-        }
-    }
-
-    fn supports_get_partial(&self) -> bool {
-        match self {
-            UnifiedAsyncStore::Zarr(store) => store.supports_get_partial(),
-            UnifiedAsyncStore::Icechunk(store) => store.supports_get_partial(),
-        }
-    }
-}
-
-impl AsyncListableStorageTraits for UnifiedAsyncStore {
-    fn list<'life0, 'async_trait>(
-        &'life0 self,
-    ) -> Pin<Box<dyn Future<Output = Result<StoreKeys, StorageError>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        Self: 'async_trait,
-    {
-        match self {
-            UnifiedAsyncStore::Zarr(store) => store.list(),
-            UnifiedAsyncStore::Icechunk(store) => store.list(),
-        }
-    }
-
-    fn list_prefix<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        prefix: &'life1 StorePrefix,
-    ) -> Pin<Box<dyn Future<Output = Result<StoreKeys, StorageError>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        match self {
-            UnifiedAsyncStore::Zarr(store) => store.list_prefix(prefix),
-            UnifiedAsyncStore::Icechunk(store) => store.list_prefix(prefix),
-        }
-    }
-
-    fn list_dir<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        prefix: &'life1 StorePrefix,
-    ) -> Pin<Box<dyn Future<Output = Result<StoreKeysPrefixes, StorageError>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        match self {
-            UnifiedAsyncStore::Zarr(store) => store.list_dir(prefix),
-            UnifiedAsyncStore::Icechunk(store) => store.list_dir(prefix),
-        }
-    }
-
-    fn size_prefix<'life0, 'life1, 'async_trait>(
-        &'life0 self,
-        prefix: &'life1 StorePrefix,
-    ) -> Pin<Box<dyn Future<Output = Result<u64, StorageError>> + Send + 'async_trait>>
-    where
-        'life0: 'async_trait,
-        'life1: 'async_trait,
-        Self: 'async_trait,
-    {
-        match self {
-            UnifiedAsyncStore::Zarr(store) => store.size_prefix(prefix),
-            UnifiedAsyncStore::Icechunk(store) => store.size_prefix(prefix),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct GeoZarrClient {
     /// One warp grid per spatial crs and spatial transform
     pub warp_grids: HashMap<WarpCacheKey, WarpGrid>,
-    /// Registry for object stores used by the client
-    pub object_store_registry: HashMap<Url, Arc<dyn ObjectStore>>,
+    /// Registry for zarr stores
+    pub store_registry: HashMap<Url, Arc<ZarrStore>>,
 }
 
 impl GeoZarrClient {
@@ -292,19 +175,7 @@ impl GeoZarrClient {
         }
     }
 
-    pub fn get_or_build_store(&mut self, url: &Url) -> Result<Arc<dyn ObjectStore>, ZarrError> {
-        match self.object_store_registry.get(url) {
-            Some(s) => Ok(s.clone()),
-            None => {
-                let new_store =
-                    GeoZarrClient::build_object_store(url).map_err(ZarrError::OjbectStoreError)?;
-                self.object_store_registry
-                    .insert(url.clone(), new_store.clone());
-                Ok(new_store)
-            }
-        }
-    }
-
+    // Icechunk only allows async creation of `ObjectStorage`
     pub async fn build_icechunk_store(
         url: &Url,
         virtual_chunks_url: Option<&Url>,
@@ -373,9 +244,42 @@ impl GeoZarrClient {
         Ok(store)
     }
 
+    pub async fn get_or_build_store(
+        &mut self,
+        url: &Url,
+        virtual_chunks_url: Option<&Url>,
+        store_type: StoreType,
+    ) -> Result<Arc<ZarrStore>, ZarrError> {
+        match self.store_registry.get(url) {
+            Some(s) => Ok(Arc::clone(s)),
+            None => {
+                let new_store = match store_type {
+                    StoreType::Zarr => {
+                        let obj_store =
+                            Self::build_object_store(url).map_err(ZarrError::OjbectStoreError)?;
+                        let zarr_store =
+                            Arc::new(ZarrStore::Zarr(AsyncObjectStore::new(obj_store)));
+                        self.store_registry
+                            .insert(url.clone(), Arc::clone(&zarr_store));
+                        zarr_store
+                    }
+                    StoreType::Icechunk => {
+                        let zarr_store = Arc::new(ZarrStore::Icechunk(
+                            Self::build_icechunk_store(url, virtual_chunks_url).await?,
+                        ));
+                        self.store_registry
+                            .insert(url.clone(), Arc::clone(&zarr_store));
+                        zarr_store
+                    }
+                };
+                Ok(new_store)
+            }
+        }
+    }
+
     // Retrieve coordinates from dimension arrays
     pub async fn load_dim_coords(
-        zarr_store: Arc<UnifiedAsyncStore>,
+        zarr_store: Arc<ZarrStore>,
         root_path: &NodePath,
         metadata: &GeozarrMetadata,
         dimension_names: &[Option<String>],
@@ -396,20 +300,21 @@ impl GeoZarrClient {
                         .join(&layout_item.asset)
                         .map_err(ZarrError::NodePathError)?;
                     let path = asset_path.join(dim).map_err(ZarrError::NodePathError)?;
-                    let array = Array::async_open(Arc::clone(&zarr_store), path.as_str())
-                        .await
-                        .map_err(ZarrError::ArrayCreateError)?;
-                    let index = DimCoords::load(&array).await?;
+                    let index =
+                        match Array::async_open(Arc::clone(&zarr_store), path.as_str()).await {
+                            Ok(array) => DimCoords::load(dim, &array).await?,
+                            Err(_) => DimCoords::new_with_meta(DimMeta::Other),
+                        };
                     dims_index.insert(path, index);
                 }
             }
         } else {
             for dim in &non_spatial_dims {
                 let path = root_path.join(dim).map_err(ZarrError::NodePathError)?;
-                let array = Array::async_open(Arc::clone(&zarr_store), path.as_str())
-                    .await
-                    .map_err(ZarrError::ArrayCreateError)?;
-                let index = DimCoords::load(&array).await?;
+                let index = match Array::async_open(Arc::clone(&zarr_store), path.as_str()).await {
+                    Ok(array) => DimCoords::load(dim, &array).await?,
+                    Err(_) => DimCoords::new_with_meta(DimMeta::Other),
+                };
                 dims_index.insert(path, index);
             }
         }
@@ -429,8 +334,9 @@ impl GeoZarrClient {
             let dim_path = asset_path
                 .join(dim_name)
                 .map_err(ZarrError::NodePathError)?;
-            if let Some((_, index)) = dim_coords.iter().find(|(path, _)| **path == dim_path) {
-                let DimMeta::Time(meta) = &index.meta;
+            if let Some((_, index)) = dim_coords.iter().find(|(path, _)| **path == dim_path)
+                && let DimMeta::Time(meta) = &index.meta
+            {
                 let val = meta.datetime_to_raw(val);
                 let coord = index.get_index(val);
                 dim_indices.insert(dim_name.clone(), coord);
@@ -475,16 +381,9 @@ impl GeoZarrClient {
 
         // let object_store = self.get_or_build_store(url)?;
         // let zarr_store = Arc::new(AsyncObjectStore::new(object_store));
-        let zarr_store = match store_type {
-            StoreType::Zarr => {
-                let store = self.get_or_build_store(url)?;
-                Arc::new(UnifiedAsyncStore::Zarr(AsyncObjectStore::new(store)))
-            }
-            StoreType::Icechunk => {
-                let ice_store = Self::build_icechunk_store(url, virtual_chunks_url).await?;
-                Arc::new(UnifiedAsyncStore::Icechunk(ice_store))
-            }
-        };
+        let zarr_store = self
+            .get_or_build_store(url, virtual_chunks_url, store_type)
+            .await?;
 
         let root_node = Node::async_open(Arc::clone(&zarr_store), "/")
             .await
@@ -615,11 +514,11 @@ impl GeoZarrClient {
 
     async fn retrieve_array_subset(
         &self,
-        array: &Array<UnifiedAsyncStore>,
+        array: &Array<ZarrStore>,
         bbox: [u64; 4],
         dimension_names: &[Option<String>],
         spatial_dims: &[String],
-        dim_coords: &HashMap<String, u64>,
+        dim_indices: &HashMap<String, u64>,
     ) -> Result<Array2<f32>, ZarrError> {
         let x_end = bbox[2]
             .checked_add(1)
@@ -634,8 +533,8 @@ impl GeoZarrClient {
             .iter()
             .flatten()
             .filter_map(|name| {
-                if let Some(&coord) = dim_coords.get(name) {
-                    return Some(coord..coord + 1);
+                if let Some(&idx) = dim_indices.get(name) {
+                    return Some(idx..idx + 1);
                 }
 
                 match spatial_dims.iter().position(|s| s == name.as_str()) {
@@ -656,18 +555,26 @@ impl GeoZarrClient {
                 .await
                 .map_err(ZarrError::ArrayError)?
                 .mapv(|val| val as f32),
-            _ => return Err(ZarrError::CastError("Unimplemented data type".into())),
+            Some("int32") => array
+                .async_retrieve_array_subset::<ArrayD<i32>>(&ranges)
+                .await
+                .map_err(ZarrError::ArrayError)?
+                .mapv(|val| val as f32),
+            Some("int64") => array
+                .async_retrieve_array_subset::<ArrayD<i64>>(&ranges)
+                .await
+                .map_err(ZarrError::ArrayError)?
+                .mapv(|val| val as f32),
+            other => {
+                println!("{other:?}");
+                return Err(ZarrError::CastError("Unimplemented data type".into()));
+            }
         };
 
         let spatial_indices = get_spatial_dims_indices(spatial_dims, dimension_names)?;
         let mut squeezed = full_subset;
-        for (idx, _) in dimension_names.iter().enumerate() {
-            // remove non-spatial axis
-            if spatial_indices
-                .iter()
-                .find(|spatial| **spatial == idx)
-                .is_none()
-            {
+        for idx in (0..dimension_names.len()).rev() {
+            if !spatial_indices.contains(&idx) {
                 squeezed = squeezed.remove_axis(Axis(idx));
             }
         }
@@ -860,31 +767,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_icechunk_storage() {
+    async fn test_fetch_3() {
+        let mut client = GeoZarrClient::new();
+        let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
+            .expect("should load cell ids");
         let path = get_path("tests/fixtures/spartacus.icechunk.zarr");
         let url = Url::from_file_path(path).expect("should be valid");
         let virtual_chunks_url =
             Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
-        let store = UnifiedAsyncStore::Icechunk(
-            GeoZarrClient::build_icechunk_store(&url, Some(&virtual_chunks_url))
-                .await
-                .expect("should open store"),
-        );
-
-        let array = Array::async_open(Arc::new(store), "/TM")
-            .await
-            .expect("should open array");
-        println!("{}", array.metadata().to_string_pretty());
-
         let query_coords = QueryCoordsBuilder::new()
-            .temporal_dim_str("time", "2026-01-01T:00:00Z")
+            .temporal_dim_str("time", "2026-05-01T00:00:00Z")
             .expect("should parse")
             .other_dim("z", 0)
             .build();
-        //let data = client
-        //    .fetch_data(&url, &cells, "TM", &query_coords, StoreType::Icechunk)
-        //    .await
-        //    .expect("should fetch")
-        //    .expect("should have data");
+        let data = client
+            .fetch_data(
+                &url,
+                &cells,
+                "TM",
+                &query_coords,
+                StoreType::Icechunk,
+                Some(&virtual_chunks_url),
+            )
+            .await
+            .expect("should fetch")
+            .expect("should have data");
+        assert_eq!(data.0.len(), cells.len());
     }
 }

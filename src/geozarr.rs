@@ -1,5 +1,4 @@
 use core::f64;
-use object_store::ObjectStore;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,13 +9,12 @@ use zarrs::{
     node::{Node, NodeMetadata, NodePath},
     plugin::ZarrVersion,
 };
-use zarrs_object_store::AsyncObjectStore;
 
 use serde::Deserialize;
 
 use crate::bbox::BBox;
-use crate::client::UnifiedAsyncStore;
 use crate::error::ZarrError;
+use crate::store::ZarrStore;
 
 #[derive(Debug, Clone, Default)]
 pub enum SpatialRegistration {
@@ -342,7 +340,7 @@ fn visit_nodes_recursive(node: &Node, nodes: &mut Vec<Node>) {
 }
 
 /// Retrieve all nodes
-pub(crate) async fn zarr_nodes(store: Arc<UnifiedAsyncStore>) -> Result<Vec<Node>, ZarrError> {
+pub(crate) async fn zarr_nodes(store: Arc<ZarrStore>) -> Result<Vec<Node>, ZarrError> {
     let mut nodes = Vec::new();
     let root_path = NodePath::root();
     let root_node = Node::async_open(Arc::clone(&store), root_path.as_str())
@@ -601,17 +599,39 @@ pub(crate) enum ZarrFillValue {
 impl ZarrFillValue {
     /// Convert based on data type
     #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn from_array(array: &Array<UnifiedAsyncStore>) -> Result<ZarrFillValue, ZarrError> {
+    pub(crate) fn from_array(array: &Array<ZarrStore>) -> Result<ZarrFillValue, ZarrError> {
         let fill_value = array.fill_value();
         let data_type = array.data_type();
         match data_type.name(ZarrVersion::V3).as_deref() {
             Some("float32") => fill_value_f32(fill_value).map(ZarrFillValue::F32),
             // Some("float64") => fill_value_f64(fill_value).map(|val| ZarrFillValue::F64(val)),
             Some("float64") => fill_value_f64(fill_value).map(|val| ZarrFillValue::F32(val as f32)),
+            Some("int32") => fill_value_i32(fill_value).map(|val| ZarrFillValue::F32(val as f32)),
+            Some("int64") => fill_value_i64(fill_value).map(|val| ZarrFillValue::F32(val as f32)),
             Some(_) => Err(ZarrError::CastError("Unsupported data type".into())),
             None => Err(ZarrError::CastError("Could not cast fill value".into())),
         }
     }
+}
+
+/// Convert fill value to `i32`
+pub(crate) fn fill_value_i32(fill_value: &FillValue) -> Result<i32, ZarrError> {
+    let bytes: [u8; 4] = fill_value
+        .as_ne_bytes()
+        .try_into()
+        .map_err(ZarrError::FillValueError)?;
+
+    Ok(i32::from_ne_bytes(bytes))
+}
+
+/// Convert fill value to `i64`
+pub(crate) fn fill_value_i64(fill_value: &FillValue) -> Result<i64, ZarrError> {
+    let bytes: [u8; 8] = fill_value
+        .as_ne_bytes()
+        .try_into()
+        .map_err(ZarrError::FillValueError)?;
+
+    Ok(i64::from_ne_bytes(bytes))
 }
 
 /// Convert fill value to `f32`

@@ -2,11 +2,11 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use zarrs::array::Array;
 use zarrs_plugin::ZarrVersion;
 
-use crate::{client::UnifiedAsyncStore, error::ZarrError};
+use crate::{error::ZarrError, store::ZarrStore};
 
 /// Metadata for temporal units and epoch
 #[derive(Debug, Clone)]
-pub(crate) struct TimeMetadata {
+pub struct TimeMetadata {
     pub(crate) units: String,
     pub(crate) epoch: DateTime<Utc>,
     #[allow(dead_code)]
@@ -15,8 +15,9 @@ pub(crate) struct TimeMetadata {
 
 /// Metadata for dimensions
 #[derive(Debug, Clone)]
-pub(crate) enum DimMeta {
+pub enum DimMeta {
     Time(TimeMetadata),
+    Other,
 }
 
 /// An index for dimensional coords
@@ -28,9 +29,16 @@ pub struct DimCoords {
 }
 
 impl DimCoords {
+    pub fn new_with_meta(meta: DimMeta) -> Self {
+        Self {
+            values: Vec::new(),
+            meta,
+        }
+    }
+
     #[allow(clippy::cast_lossless)]
     #[allow(clippy::cast_precision_loss)]
-    pub async fn load(coords: &Array<UnifiedAsyncStore>) -> Result<Self, ZarrError> {
+    pub async fn load(dim: &str, coords: &Array<ZarrStore>) -> Result<Self, ZarrError> {
         let data_type = coords.data_type();
         let name = data_type.name(ZarrVersion::V3);
 
@@ -59,23 +67,26 @@ impl DimCoords {
 
         // Extract metadata
         let attrs = coords.attributes();
-        let units = attrs
-            .get("units")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ZarrError::TimeError("Could not get time units".into()))?;
+        let meta = if dim.contains("time") {
+            let units = attrs
+                .get("units")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ZarrError::TimeError("Could not get time units".into()))?;
 
-        let calendar = attrs
-            .get("calendar")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| ZarrError::TimeError("Could not get calendar metadata".into()))?;
+            let calendar = attrs
+                .get("calendar")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ZarrError::TimeError("Could not get calendar metadata".into()))?;
 
-        let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
+            let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
+            DimMeta::Time(time_meta)
+        } else {
+            DimMeta::Other
+        };
+
         let (values, _offset) = data.into_raw_vec_and_offset();
 
-        Ok(Self {
-            values,
-            meta: DimMeta::Time(time_meta),
-        })
+        Ok(Self { values, meta })
     }
 
     /// Get index of coordinate along dimension
