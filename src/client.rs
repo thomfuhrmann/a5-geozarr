@@ -15,6 +15,7 @@ use zarrs::{
     array::Array,
     node::{Node, NodePath},
     plugin::ZarrVersion,
+    storage::AsyncReadableStorageTraits,
 };
 use zarrs_icechunk::{
     AsyncIcechunkStore,
@@ -121,6 +122,11 @@ impl Default for QueryCoordsBuilder {
     }
 }
 
+pub enum UnifiedAsyncStore {
+    Zarr(AsyncObjectStore<Arc<dyn ObjectStore>>),
+    Icechunk(AsyncIcechunkStore),
+}
+
 #[derive(Debug, Default)]
 pub struct GeoZarrClient {
     /// One warp grid per spatial crs and spatial transform
@@ -189,8 +195,8 @@ impl GeoZarrClient {
 
     pub async fn build_icechunk_store(
         url: &Url,
-        virtual_chunks_url: &Url,
-    ) -> Result<Arc<AsyncIcechunkStore>, ZarrError> {
+        virtual_chunks_url: Option<&Url>,
+    ) -> Result<AsyncIcechunkStore, ZarrError> {
         let storage = match url.scheme() {
             "file" => {
                 let path = url.to_file_path().map_err(|_| {
@@ -222,6 +228,12 @@ impl GeoZarrClient {
             }))?,
         };
 
+        let virtual_chunks_url = if let Some(virtual_chunks_url) = virtual_chunks_url {
+            virtual_chunks_url
+        } else {
+            &Url::parse("").expect("should parse empty url")
+        };
+
         let container = VirtualChunkContainer::new(
             virtual_chunks_url.to_string(),
             icechunk::ObjectStoreConfig::Http(Default::default()),
@@ -245,7 +257,7 @@ impl GeoZarrClient {
             .await
             .map_err(ZarrError::IcechunkRepositoryError)?;
 
-        let store = Arc::new(AsyncIcechunkStore::new(session));
+        let store = AsyncIcechunkStore::new(session);
         Ok(store)
     }
 
@@ -340,7 +352,8 @@ impl GeoZarrClient {
         cell_ids: &[u64],
         data_var_name: &str,
         query_coords: &QueryCoords,
-        _store_type: StoreType,
+        store_type: StoreType,
+        virtual_chunks_url: Option<&Url>,
     ) -> Result<Option<(Box<[f32]>, f32, f32)>, ZarrError> {
         if cell_ids.is_empty() {
             return Err(ZarrError::ParameterError(
@@ -348,8 +361,18 @@ impl GeoZarrClient {
             ));
         }
 
-        let store = self.get_or_build_store(url)?;
-        let zarr_store = Arc::new(AsyncObjectStore::new(store));
+        // let object_store = self.get_or_build_store(url)?;
+        // let zarr_store = Arc::new(AsyncObjectStore::new(object_store));
+        let zarr_store = match store_type {
+            StoreType::Zarr => {
+                let store = self.get_or_build_store(url)?;
+                Arc::new(UnifiedAsyncStore::Zarr(AsyncObjectStore::new(store)))
+            }
+            StoreType::Icechunk => {
+                let ice_store = Self::build_icechunk_store(url, virtual_chunks_url).await?;
+                Arc::new(UnifiedAsyncStore::Icechunk(ice_store))
+            }
+        };
 
         let root_node = Node::async_open(Arc::clone(&zarr_store), "/")
             .await
@@ -715,5 +738,33 @@ mod tests {
             .expect("should fetch")
             .expect("should have data");
         assert_eq!(data.0.len(), cells.len());
+    }
+
+    #[tokio::test]
+    async fn test_icechunk_storage() {
+        let path = get_path("tests/fixtures/spartacus.icechunk.zarr");
+        let url = Url::from_file_path(path).expect("should be valid");
+        let virtual_chunks_url =
+            Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
+        let store = GeoZarrClient::build_icechunk_store(&url, &virtual_chunks_url)
+            .await
+            .expect("should open store");
+
+        let array = Array::async_open(store.clone(), "/TM")
+            .await
+            .expect("should open array");
+        println!("{}", array.metadata().to_string_pretty());
+
+        let query_coords = QueryCoordsBuilder::new()
+            .temporal_dim_str("time", "2026-01-01T:00:00Z")
+            .expect("should parse")
+            .other_dim("z", 0)
+            .expect("should parse")
+            .build();
+        let data = client
+            .fetch_data(&url, &cells, "TM", &query_coords, StoreType::Icechunk)
+            .await
+            .expect("should fetch")
+            .expect("should have data");
     }
 }
