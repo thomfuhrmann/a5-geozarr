@@ -1,5 +1,6 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
-use zarrs::array::Array;
+use moka::sync::Cache;
+use zarrs::array::{Array, ElementOwned};
 use zarrs_plugin::ZarrVersion;
 
 use crate::{error::ZarrError, store::ZarrStore};
@@ -20,12 +21,183 @@ pub enum DimMeta {
     Other,
 }
 
+impl DimMeta {
+    /// Extract metadata from array attributes
+    pub fn get_metadata(dim: &str, coords: &Array<ZarrStore>) -> Result<Self, ZarrError> {
+        let attrs = coords.attributes();
+        if dim.contains("time") {
+            let units = attrs
+                .get("units")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ZarrError::TimeError("Could not get time units".into()))?;
+
+            let calendar = attrs
+                .get("calendar")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ZarrError::TimeError("Could not get calendar metadata".into()))?;
+
+            let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
+            Ok(Self::Time(time_meta))
+        } else {
+            Ok(Self::Other)
+        }
+    }
+}
+
 /// An index for dimensional coords
 #[derive(Debug, Clone)]
 pub struct DimCoords {
     /// In-memory sorted array of coordinate values
     pub(crate) values: Vec<f64>,
     pub(crate) meta: DimMeta,
+}
+
+/// A key for the chunk cache
+pub trait CacheKey {
+    fn to_cache_key(self) -> u64;
+}
+
+impl CacheKey for f32 {
+    fn to_cache_key(self) -> u64 {
+        (self * 1000.0).round() as u64
+    }
+}
+
+impl CacheKey for f64 {
+    fn to_cache_key(self) -> u64 {
+        (self * 1000.0).round() as u64
+    }
+}
+
+macro_rules! impl_integer_cache_key {
+    ($($t:ty),*) => {
+        $(
+            impl CacheKey for $t {
+                fn to_cache_key(self) -> u64 {
+                    self as u64
+                }
+            }
+        )*
+    };
+}
+
+impl_integer_cache_key!(i32, i64, u32, u64);
+
+/// Location of a coordinate value as chunk index plus offset
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChunkLocation {
+    pub chunk_index: u64,
+    pub chunk_offset: u64,
+}
+
+impl ChunkLocation {
+    pub fn new(chunk_index: u64, chunk_offset: u64) -> Self {
+        Self {
+            chunk_index,
+            chunk_offset,
+        }
+    }
+
+    pub fn absolute_offset(&self, chunk_size: u64) -> u64 {
+        (self.chunk_index * chunk_size) + self.chunk_offset
+    }
+}
+
+/// A cache for mappings from coordinate values to chunk indices and offsets
+#[derive(Debug)]
+pub struct ChunkIndex {
+    cache: Cache<u64, ChunkLocation>,
+}
+
+impl Default for ChunkIndex {
+    fn default() -> Self {
+        Self {
+            cache: Cache::new(10_000),
+        }
+    }
+}
+
+impl ChunkIndex {
+    pub fn with_capacity(cap: u64) -> Self {
+        Self {
+            cache: Cache::new(cap),
+        }
+    }
+
+    pub async fn get_chunk_location<T: CacheKey + ElementOwned + PartialOrd + Clone>(
+        &mut self,
+        coords: &Array<ZarrStore>,
+        val: T,
+    ) -> Result<ChunkLocation, ZarrError> {
+        let key = val.clone().to_cache_key();
+        if let Some(loc) = self.cache.get(&key) {
+            Ok(loc)
+        } else {
+            let loc = Self::find_chunk_location(coords, val).await?;
+            self.cache.insert(key, loc.clone());
+            Ok(loc)
+        }
+    }
+
+    async fn find_chunk_location<T: CacheKey + ElementOwned + PartialOrd>(
+        coords: &Array<ZarrStore>,
+        val: T,
+    ) -> Result<ChunkLocation, ZarrError> {
+        let shape = coords.shape();
+        let total_len = shape[0];
+
+        // Get chunk size for the dimension
+        let chunk_shape = coords.chunk_shape(&[0]).map_err(ZarrError::ArrayError)?;
+        let chunk_size = u64::from(chunk_shape[0]);
+
+        let total_chunks = total_len.div_ceil(chunk_size);
+
+        let mut low_chunk = 0;
+        let mut high_chunk = total_chunks - 1;
+
+        // Binary search to find the exact chunk containing 'val'
+        while low_chunk <= high_chunk {
+            let mid_chunk = low_chunk + (high_chunk - low_chunk) / 2;
+
+            // Retrieve the chunk data
+            let chunk = coords
+                .async_retrieve_chunk::<Vec<T>>(&[mid_chunk])
+                .await
+                .map_err(ZarrError::ArrayError)?;
+
+            if chunk.is_empty() {
+                return Err(ZarrError::ArrayError(zarrs::array::ArrayError::Other(
+                    "Retrieved empty chunk".into(),
+                )));
+            }
+
+            let chunk_start_val = &chunk[0];
+            let chunk_end_val = &chunk[chunk.len() - 1];
+
+            if val < *chunk_start_val {
+                if mid_chunk == 0 {
+                    // Value is smaller than the first coordinate in the array
+                    return Ok(ChunkLocation::new(0, 0));
+                }
+                high_chunk = mid_chunk - 1;
+            } else if val > *chunk_end_val {
+                low_chunk = mid_chunk + 1;
+            } else {
+                // The value lies within this chunk! Find exact local offset.
+                // We can binary search or scan locally within the chunk vector.
+                let offset = chunk
+                    .iter()
+                    .position(|x| x >= &val)
+                    .unwrap_or(chunk.len() - 1) as u64;
+
+                return Ok(ChunkLocation::new(mid_chunk, offset));
+            }
+        }
+
+        Err(ZarrError::ArrayError(zarrs::array::ArrayError::Other(
+            "Value not found in coordinate array".into(),
+        )))
+    }
 }
 
 impl DimCoords {
@@ -149,7 +321,6 @@ impl TimeMetadata {
         })
     }
 
-    #[allow(clippy::cast_precision_loss)]
     pub fn datetime_to_raw(&self, val: &DateTime<Utc>) -> f64 {
         let duration = val.signed_duration_since(self.epoch);
         let secs = duration.num_seconds();
@@ -167,5 +338,49 @@ impl TimeMetadata {
         };
 
         total_seconds as f64 * scale
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use zarrs::array::data_type::{Float64DataType, Int64DataType};
+
+    use super::*;
+    use crate::test_utils::get_zarr_store;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn test_load_dim_coords() {
+        // load pyramid data
+        let zarr_store = get_zarr_store();
+        let array = Array::async_open(Arc::clone(&zarr_store), "/0/time")
+            .await
+            .expect("should open array");
+
+        let meta = DimMeta::get_metadata("time", &array).expect("should have metadata");
+        let data_type = array.data_type();
+
+        let val = "2014-12-31T12:00:00Z";
+        let dt = DateTime::parse_from_rfc3339(val)
+            .expect("should have dt")
+            .with_timezone(&Utc);
+
+        let mut index = ChunkIndex::with_capacity(1000);
+        if let DimMeta::Time(meta) = meta {
+            let raw = meta.datetime_to_raw(&dt);
+            let loc = if data_type.is::<Int64DataType>() {
+                let val = raw as i64;
+                index.get_chunk_location(&array, val).await
+            } else if data_type.is::<Float64DataType>() {
+                let val = raw; // already f64
+                index.get_chunk_location(&array, val).await
+            } else {
+                panic!("Unsupported time coordinate data type");
+            }
+            .expect("should have location");
+
+            assert_eq!(loc, ChunkLocation::new(0, 2918));
+        }
     }
 }

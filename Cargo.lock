@@ -1774,6 +1774,7 @@ dependencies = [
  "csv",
  "image",
  "inventory",
+ "moka",
  "ndarray",
  "object_store",
  "proj",

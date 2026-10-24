@@ -9,6 +9,7 @@ bytemuck = "1.25.2"
 chrono = "0.4.43"
 image = "0.25.9"
 inventory = "0.3.25"
+moka = { version = "0.12.16", features = ["future"] }
 ndarray = "0.17.2"
 object_store = { version = "0.14.2", features = [
     "http",

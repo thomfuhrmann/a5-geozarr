@@ -12,7 +12,13 @@ use object_store::{
 };
 use url::Url;
 use zarrs::{
-    array::Array,
+    array::{
+        Array,
+        data_type::{
+            Float32DataType, Float64DataType, Int32DataType, Int64DataType, UInt32DataType,
+            UInt64DataType,
+        },
+    },
     node::{Node, NodePath},
     plugin::ZarrVersion,
 };
@@ -26,7 +32,7 @@ use zarrs_icechunk::{
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::{
-    dimension::{DimCoords, DimMeta},
+    dimension::{ChunkIndex, DimCoords, DimMeta},
     error::ZarrError,
     geozarr::{
         GeozarrMetadata, ZarrFillValue, calculate_resolution_levels, get_non_spatial_dims,
@@ -128,6 +134,8 @@ pub struct GeoZarrClient {
     pub warp_grids: HashMap<WarpCacheKey, WarpGrid>,
     /// Registry for zarr stores
     pub store_registry: HashMap<Url, Arc<ZarrStore>>,
+    /// Cache for mapping from coordinate values to chunk indices and offsets
+    pub chunk_index: ChunkIndex,
 }
 
 impl GeoZarrClient {
@@ -363,6 +371,108 @@ impl GeoZarrClient {
         Ok(dim_indices)
     }
 
+    pub async fn abs_offset(
+        &mut self,
+        array: &Array<ZarrStore>,
+        val: f64,
+    ) -> Result<u64, ZarrError> {
+        let data_type = array.data_type();
+        let loc = if data_type.is::<Int64DataType>() {
+            self.chunk_index
+                .get_chunk_location(array, val as i64)
+                .await?
+        } else if data_type.is::<Int32DataType>() {
+            self.chunk_index
+                .get_chunk_location(array, val as i32)
+                .await?
+        } else if data_type.is::<UInt64DataType>() {
+            self.chunk_index
+                .get_chunk_location(array, val as u64)
+                .await?
+        } else if data_type.is::<UInt32DataType>() {
+            self.chunk_index
+                .get_chunk_location(array, val as u32)
+                .await?
+        } else if data_type.is::<Float64DataType>() {
+            self.chunk_index.get_chunk_location(array, val).await?
+        } else if data_type.is::<Float32DataType>() {
+            self.chunk_index
+                .get_chunk_location(array, val as f32)
+                .await?
+        } else {
+            return Err(ZarrError::CastError(format!(
+                "Unsupported data type: {data_type}"
+            )));
+        };
+        let chunk_size = u64::from(array.chunk_shape(&[0]).map_err(ZarrError::ArrayError)?[0]);
+        Ok(loc.absolute_offset(chunk_size))
+    }
+
+    // Find array indices for non-spatial coordinates
+    pub async fn load_dim_indices(
+        &mut self,
+        zarr_store: Arc<ZarrStore>,
+        root_path: &NodePath,
+        metadata: &GeozarrMetadata,
+        query_coords: &QueryCoords,
+    ) -> Result<HashMap<NodePath, u64>, ZarrError> {
+        let mut dims_index = HashMap::new();
+
+        // Determine target asset paths: either multi-scale asset paths or just the base root_path
+        let asset_paths: Vec<NodePath> = if let Some(multiscales) = &metadata.multiscales {
+            multiscales
+                .layout
+                .iter()
+                .map(|item| {
+                    root_path
+                        .join(&item.asset)
+                        .map_err(ZarrError::NodePathError)
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            vec![root_path.clone()]
+        };
+
+        for asset_path in asset_paths {
+            // Process temporal dimensions
+            for (dim_name, val) in &query_coords.temporal_dims {
+                let dim_path = asset_path
+                    .join(dim_name)
+                    .map_err(ZarrError::NodePathError)?;
+                let offset =
+                    match Array::async_open(Arc::clone(&zarr_store), dim_path.as_str()).await {
+                        Ok(array) => {
+                            let meta = DimMeta::get_metadata(dim_name, &array)?;
+                            if let DimMeta::Time(meta) = &meta {
+                                let raw = meta.datetime_to_raw(val);
+                                self.abs_offset(&array, raw).await?
+                            } else {
+                                0
+                            }
+                        }
+                        // if dimension is present in data variable but no physical array is present
+                        Err(_) => 0,
+                    };
+                dims_index.insert(dim_path, offset);
+            }
+
+            // Process other dimensions
+            for (dim_name, val) in &query_coords.other_dims {
+                let dim_path = asset_path
+                    .join(dim_name)
+                    .map_err(ZarrError::NodePathError)?;
+                let offset =
+                    match Array::async_open(Arc::clone(&zarr_store), dim_path.as_str()).await {
+                        Ok(array) => self.abs_offset(&array, *val).await?,
+                        Err(_) => 0,
+                    };
+                dims_index.insert(dim_path, offset);
+            }
+        }
+
+        Ok(dims_index)
+    }
+
     /// Retrieve data for given cells
     pub async fn fetch_data(
         &mut self,
@@ -475,6 +585,8 @@ impl GeoZarrClient {
             .ok_or_else(|| ZarrError::DimensionError("Missing dimension_names".into()))?;
 
         // load coordinates of non-spatial dimensions
+        // TODO: only load required chunks
+        // cache fetched chunks and mappings from coordinate value to chunk coord and offset
         let dim_coords = Self::load_dim_coords(
             zarr_store,
             root_node.path(),
