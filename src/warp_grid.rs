@@ -9,38 +9,33 @@ use crate::{
 
 pub const TARGET_CRS: &str = "EPSG:4326";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WarpGrid {
     pub grid: BTreeMap<u64, (i64, i64)>,
-    pub grid_bbox: Option<[u64; 4]>,
 }
 
 impl WarpGrid {
-    pub fn new(grid: BTreeMap<u64, (i64, i64)>, grid_bbox: Option<[u64; 4]>) -> Self {
-        Self { grid, grid_bbox }
-    }
-
-    pub fn calculate_warp_grid(
+    pub fn update_warp_grid(
+        &mut self,
         cell_ids: &[u64],
-        geozarr_metadata: &GeozarrMetadata,
-    ) -> Result<Self, ZarrError> {
+        metadata: &GeozarrMetadata,
+    ) -> Result<Option<[u64; 4]>, ZarrError> {
         let spatial_transform =
-            geozarr_metadata
+            metadata
                 .spatial_transform
                 .ok_or(ZarrError::GeoZarrMetadataError(
                     "Missing spatial:transform".into(),
                 ))?;
 
-        let spatial_shape =
-            geozarr_metadata
-                .spatial_shape
-                .ok_or(ZarrError::GeoZarrMetadataError(
-                    "Missing spatial:shape".into(),
-                ))?;
+        let spatial_shape = metadata
+            .spatial_shape
+            .ok_or(ZarrError::GeoZarrMetadataError(
+                "Missing spatial:shape".into(),
+            ))?;
 
-        let spatial_registration = &geozarr_metadata.spatial_registration;
+        let spatial_registration = &metadata.spatial_registration;
 
-        let crs_str = &geozarr_metadata
+        let crs_str = &metadata
             .proj
             .clone()
             .map(|proj| proj.into_string())
@@ -53,14 +48,12 @@ impl WarpGrid {
         let inv_trafo =
             proj::Proj::try_from((TARGET_CRS, crs_str)).map_err(ZarrError::ProjCreateError)?;
 
-        let mut indices = BTreeMap::new();
-
         let mut cell_grid_left = i64::MAX;
         let mut cell_grid_right = i64::MIN;
         let mut cell_grid_bottom = i64::MIN;
         let mut cell_grid_top = i64::MAX;
 
-        // TODO: check for geographical crs based on metadata
+        // TODO: check for geographical CRS based on metadata
         let src_uses_0_360 = crs_str == "EPSG:4326"
             && (spatial_transform[2] > 180.0
                 || (spatial_transform[2] + spatial_transform[0] * spatial_shape[1] as f64) > 180.0);
@@ -84,6 +77,7 @@ impl WarpGrid {
                 x_src += 360.0;
             }
 
+            // absolute pixel index from left to right
             let right = match spatial_registration {
                 SpatialRegistration::Pixel => {
                     (src_inv_affine[0] * x_src + src_inv_affine[1] * y_src + src_inv_affine[2])
@@ -95,6 +89,7 @@ impl WarpGrid {
                 }
             } as i64;
 
+            // absolute pixel index from top to bottom
             let down = match spatial_registration {
                 SpatialRegistration::Pixel => {
                     (src_inv_affine[3] * x_src + src_inv_affine[4] * y_src + src_inv_affine[5])
@@ -116,23 +111,20 @@ impl WarpGrid {
                 cell_grid_bottom = cell_grid_bottom.max(down);
             }
 
-            indices.insert(cell_id, (right, down));
+            self.grid.entry(cell_id).or_insert((right, down));
         }
 
-        // tile grid lies outside source data
+        // tile grid lies entirely outside source data
         if !has_valid_pixel {
-            return Ok(WarpGrid::new(indices, None));
+            return Ok(None);
         }
 
-        Ok(WarpGrid::new(
-            indices,
-            Some([
-                cell_grid_left.cast_unsigned(),
-                cell_grid_top.cast_unsigned(),
-                cell_grid_right.cast_unsigned(),
-                cell_grid_bottom.cast_unsigned(),
-            ]),
-        ))
+        Ok(Some([
+            cell_grid_left.cast_unsigned(),
+            cell_grid_top.cast_unsigned(),
+            cell_grid_right.cast_unsigned(),
+            cell_grid_bottom.cast_unsigned(),
+        ]))
     }
 
     /// Calculates inverse affine transformation
@@ -185,7 +177,9 @@ mod tests {
             .with_proj(Some(Proj::Code("EPSG:4326".into())))
             .with_spatial_shape(Some([50, 20]))
             .with_spatial_transform(Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]));
-        let warp_grid = WarpGrid::calculate_warp_grid(&CELL_IDS, &metadata)
+        let mut warp_grid = WarpGrid::default();
+        let _ = warp_grid
+            .update_warp_grid(&CELL_IDS, &metadata)
             .expect("should calculate warp grid");
         assert_eq!(warp_grid.grid.len(), CELL_IDS.len());
     }
@@ -196,7 +190,9 @@ mod tests {
             .with_proj(Some(Proj::Code("EPSG:4326".into())))
             .with_spatial_shape(Some([50, 20]))
             .with_spatial_transform(Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]));
-        let warp_grid = WarpGrid::calculate_warp_grid(&CELL_IDS, &metadata)
+        let mut warp_grid = WarpGrid::default();
+        let _ = warp_grid
+            .update_warp_grid(&CELL_IDS, &metadata)
             .expect("should calculate warp grid");
         let exp = CELL_IDS
             .iter()
@@ -218,8 +214,10 @@ mod tests {
             .with_proj(Some(Proj::Code("EPSG:4326".into())))
             .with_spatial_shape(Some([10, 10]))
             .with_spatial_transform(Some([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]));
-        let warp_grid = WarpGrid::calculate_warp_grid(&CELL_IDS, &metadata)
+        let mut warp_grid = WarpGrid::default();
+        let bbox = warp_grid
+            .update_warp_grid(&CELL_IDS, &metadata)
             .expect("should calculate warp grid");
-        assert!(warp_grid.grid_bbox.is_none());
+        assert!(bbox.is_none());
     }
 }

@@ -1,56 +1,8 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use moka::sync::Cache;
 use zarrs::array::{Array, ElementOwned};
-use zarrs_plugin::ZarrVersion;
 
 use crate::{error::ZarrError, store::ZarrStore};
-
-/// Metadata for temporal units and epoch
-#[derive(Debug, Clone)]
-pub struct TimeMetadata {
-    pub(crate) units: String,
-    pub(crate) epoch: DateTime<Utc>,
-    #[allow(dead_code)]
-    pub(crate) calendar: String,
-}
-
-/// Metadata for dimensions
-#[derive(Debug, Clone)]
-pub enum DimMeta {
-    Time(TimeMetadata),
-    Other,
-}
-
-impl DimMeta {
-    /// Extract metadata from array attributes
-    pub fn get_metadata(dim: &str, coords: &Array<ZarrStore>) -> Result<Self, ZarrError> {
-        let attrs = coords.attributes();
-        if dim.contains("time") {
-            let units = attrs
-                .get("units")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ZarrError::TimeError("Could not get time units".into()))?;
-
-            let calendar = attrs
-                .get("calendar")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ZarrError::TimeError("Could not get calendar metadata".into()))?;
-
-            let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
-            Ok(Self::Time(time_meta))
-        } else {
-            Ok(Self::Other)
-        }
-    }
-}
-
-/// An index for dimensional coords
-#[derive(Debug, Clone)]
-pub struct DimCoords {
-    /// In-memory sorted array of coordinate values
-    pub(crate) values: Vec<f64>,
-    pub(crate) meta: DimMeta,
-}
 
 /// A key for the chunk cache
 pub trait CacheKey {
@@ -124,18 +76,19 @@ impl ChunkIndex {
         }
     }
 
-    pub async fn get_chunk_location<T: CacheKey + ElementOwned + PartialOrd + Clone>(
+    pub async fn get_chunk_index<T: CacheKey + ElementOwned + PartialOrd + Clone>(
         &mut self,
         coords: &Array<ZarrStore>,
         val: T,
-    ) -> Result<ChunkLocation, ZarrError> {
+    ) -> Result<u64, ZarrError> {
         let key = val.clone().to_cache_key();
+        let chunk_size = u64::from(coords.chunk_shape(&[0]).map_err(ZarrError::ArrayError)?[0]);
         if let Some(loc) = self.cache.get(&key) {
-            Ok(loc)
+            Ok(loc.absolute_offset(chunk_size))
         } else {
             let loc = Self::find_chunk_location(coords, val).await?;
             self.cache.insert(key, loc.clone());
-            Ok(loc)
+            Ok(loc.absolute_offset(chunk_size))
         }
     }
 
@@ -200,46 +153,18 @@ impl ChunkIndex {
     }
 }
 
-impl DimCoords {
-    pub fn new_with_meta(meta: DimMeta) -> Self {
-        Self {
-            values: Vec::new(),
-            meta,
-        }
-    }
+/// Metadata for dimensions
+#[derive(Debug, Clone)]
+pub enum DimMeta {
+    Time(TimeMetadata),
+    Other,
+}
 
-    #[allow(clippy::cast_lossless)]
-    #[allow(clippy::cast_precision_loss)]
-    pub async fn load(dim: &str, coords: &Array<ZarrStore>) -> Result<Self, ZarrError> {
-        let data_type = coords.data_type();
-        let name = data_type.name(ZarrVersion::V3);
-
-        let data = match name.as_deref() {
-            Some("int32") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<i32>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?
-                .mapv(|val| val as f64),
-            Some("int64") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<i64>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?
-                .mapv(|val| val as f64),
-            Some("float32") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<f32>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?
-                .mapv(f64::from),
-            Some("float64") => coords
-                .async_retrieve_array_subset::<ndarray::Array1<f64>>(&coords.subset_all())
-                .await
-                .map_err(ZarrError::ArrayError)?,
-            _ => return Err(ZarrError::DimensionError("Data type not supported".into())),
-        };
-
-        // Extract metadata
+impl DimMeta {
+    /// Extract metadata from array attributes
+    pub fn get_metadata(dim: &str, coords: &Array<ZarrStore>) -> Result<Self, ZarrError> {
         let attrs = coords.attributes();
-        let meta = if dim.contains("time") {
+        if dim.contains("time") {
             let units = attrs
                 .get("units")
                 .and_then(|v| v.as_str())
@@ -251,50 +176,20 @@ impl DimCoords {
                 .ok_or_else(|| ZarrError::TimeError("Could not get calendar metadata".into()))?;
 
             let time_meta = TimeMetadata::parse_zarr_time_attrs(units, calendar)?;
-            DimMeta::Time(time_meta)
+            Ok(Self::Time(time_meta))
         } else {
-            DimMeta::Other
-        };
-
-        let (values, _offset) = data.into_raw_vec_and_offset();
-
-        Ok(Self { values, meta })
-    }
-
-    /// Get index of coordinate along dimension
-    pub fn get_index(&self, val: f64) -> u64 {
-        self.find_closest_binary(val) as u64
-    }
-
-    /// Binary search helper function
-    fn find_closest_binary(&self, target: f64) -> usize {
-        let array = &self.values;
-        match array.binary_search_by(|probe| {
-            probe
-                .partial_cmp(&target)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        }) {
-            Ok(index) => index,
-            Err(index) => {
-                // 'index' is the insertion point
-                if index == 0 {
-                    return 0;
-                }
-                if index >= array.len() {
-                    return array.len() - 1;
-                }
-
-                let diff_left = (target - array[index - 1]).abs();
-                let diff_right = (array[index] - target).abs();
-
-                if diff_left < diff_right {
-                    index - 1
-                } else {
-                    index
-                }
-            }
+            Ok(Self::Other)
         }
     }
+}
+
+/// Metadata for temporal units and epoch
+#[derive(Debug, Clone)]
+pub struct TimeMetadata {
+    pub(crate) units: String,
+    pub(crate) epoch: DateTime<Utc>,
+    #[allow(dead_code)]
+    pub(crate) calendar: String,
 }
 
 impl TimeMetadata {
@@ -371,16 +266,16 @@ mod tests {
             let raw = meta.datetime_to_raw(&dt);
             let loc = if data_type.is::<Int64DataType>() {
                 let val = raw as i64;
-                index.get_chunk_location(&array, val).await
+                index.get_chunk_index(&array, val).await
             } else if data_type.is::<Float64DataType>() {
                 let val = raw; // already f64
-                index.get_chunk_location(&array, val).await
+                index.get_chunk_index(&array, val).await
             } else {
                 panic!("Unsupported time coordinate data type");
             }
             .expect("should have location");
 
-            assert_eq!(loc, ChunkLocation::new(0, 2918));
+            assert_eq!(loc, 2918);
         }
     }
 }
