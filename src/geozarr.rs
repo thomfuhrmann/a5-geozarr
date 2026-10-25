@@ -2,12 +2,10 @@ use core::f64;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
-use zarrs::array::FillValue;
 use zarrs::group::GroupMetadata;
 use zarrs::{
-    array::{Array, ArrayMetadata, DimensionName},
+    array::{ArrayMetadata, DimensionName},
     node::{Node, NodeMetadata, NodePath},
-    plugin::ZarrVersion,
 };
 
 use serde::Deserialize;
@@ -577,70 +575,6 @@ pub(crate) fn select_best_level(
         .map(|lvl| &lvl.item))
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ZarrFillValue {
-    F32(f32),
-    // F64(f64),
-}
-
-impl ZarrFillValue {
-    /// Convert based on data type
-    #[allow(clippy::cast_possible_truncation)]
-    pub(crate) fn from_array(array: &Array<ZarrStore>) -> Result<ZarrFillValue, ZarrError> {
-        let fill_value = array.fill_value();
-        let data_type = array.data_type();
-        match data_type.name(ZarrVersion::V3).as_deref() {
-            Some("float32") => fill_value_f32(fill_value).map(ZarrFillValue::F32),
-            // Some("float64") => fill_value_f64(fill_value).map(|val| ZarrFillValue::F64(val)),
-            Some("float64") => fill_value_f64(fill_value).map(|val| ZarrFillValue::F32(val as f32)),
-            Some("int32") => fill_value_i32(fill_value).map(|val| ZarrFillValue::F32(val as f32)),
-            Some("int64") => fill_value_i64(fill_value).map(|val| ZarrFillValue::F32(val as f32)),
-            Some(_) => Err(ZarrError::CastError("Unsupported data type".into())),
-            None => Err(ZarrError::CastError("Could not cast fill value".into())),
-        }
-    }
-}
-
-/// Convert fill value to `i32`
-pub(crate) fn fill_value_i32(fill_value: &FillValue) -> Result<i32, ZarrError> {
-    let bytes: [u8; 4] = fill_value
-        .as_ne_bytes()
-        .try_into()
-        .map_err(ZarrError::FillValueError)?;
-
-    Ok(i32::from_ne_bytes(bytes))
-}
-
-/// Convert fill value to `i64`
-pub(crate) fn fill_value_i64(fill_value: &FillValue) -> Result<i64, ZarrError> {
-    let bytes: [u8; 8] = fill_value
-        .as_ne_bytes()
-        .try_into()
-        .map_err(ZarrError::FillValueError)?;
-
-    Ok(i64::from_ne_bytes(bytes))
-}
-
-/// Convert fill value to `f32`
-pub(crate) fn fill_value_f32(fill_value: &FillValue) -> Result<f32, ZarrError> {
-    let bytes: [u8; 4] = fill_value
-        .as_ne_bytes()
-        .try_into()
-        .map_err(ZarrError::FillValueError)?;
-
-    Ok(f32::from_ne_bytes(bytes))
-}
-
-/// Convert fill value to `f64`
-pub(crate) fn fill_value_f64(fill_value: &FillValue) -> Result<f64, ZarrError> {
-    let bytes: [u8; 8] = fill_value
-        .as_ne_bytes()
-        .try_into()
-        .map_err(ZarrError::FillValueError)?;
-
-    Ok(f64::from_ne_bytes(bytes))
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -737,17 +671,5 @@ mod tests {
         let scales = abs_scales([1.0, 1.0], &multiscales, &indices[..]);
         let first = scales.get("1");
         assert_eq!(first, Some(&2.0));
-    }
-
-    #[tokio::test]
-    async fn test_fill_value() {
-        let store = get_zarr_store();
-        let data_var = Array::async_open(Arc::clone(&store), "/0/air")
-            .await
-            .unwrap();
-        let fill_value = ZarrFillValue::from_array(&data_var).expect("should have fill value");
-        match fill_value {
-            ZarrFillValue::F32(val) => assert!(val.is_nan()),
-        }
     }
 }

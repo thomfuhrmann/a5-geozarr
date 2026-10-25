@@ -7,6 +7,7 @@ edition = "2024"
 a5 = { git = "https://github.com/felixpalmer/a5-rs" }
 bytemuck = "1.25.2"
 chrono = "0.4.43"
+icechunk = "2.3.0"
 image = "0.25.9"
 inventory = "0.3.25"
 moka = { version = "0.12.16", features = ["future"] }

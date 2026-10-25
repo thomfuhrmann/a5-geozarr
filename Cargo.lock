@@ -1772,6 +1772,7 @@ dependencies = [
  "bytemuck",
  "chrono",
  "csv",
+ "icechunk",
  "image",
  "inventory",
  "moka",

@@ -1,15 +1,9 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    hash::Hasher,
-    sync::Arc,
-};
+use std::{collections::HashMap, hash::Hasher, sync::Arc, vec};
 
 use chrono::{DateTime, Utc};
+use icechunk::{new_local_filesystem_storage, storage::new_http_storage};
 use ndarray::{Array2, ArrayD, Axis, Ix2};
-use object_store::{
-    Error, ObjectStore, aws::AmazonS3Builder, azure::MicrosoftAzureBuilder,
-    gcp::GoogleCloudStorageBuilder, http::HttpBuilder, local::LocalFileSystem,
-};
+use object_store::{Error, ObjectStore, http::HttpBuilder, local::LocalFileSystem};
 use url::Url;
 use zarrs::{
     array::{
@@ -38,7 +32,7 @@ use crate::{
         get_spatial_dims_indices, native_cell_res, select_best_level, zarr_nodes,
     },
     store::ZarrStore,
-    warp_grid::{self, TARGET_CRS, WarpGrid},
+    warp_grid::{TARGET_CRS, WarpGrid},
 };
 
 #[derive(Debug, Clone)]
@@ -164,29 +158,12 @@ impl GeoZarrClient {
                 Ok(Arc::new(store))
             }
             "http" | "https" => {
-                // HttpBuilder expects the base URL (typically origin + path prefix)
                 let store = HttpBuilder::new().with_url(url.as_str()).build()?;
                 Ok(Arc::new(store))
             }
-            "s3" | "s3a" => {
-                let s3 = AmazonS3Builder::from_env().with_url(url.as_str()).build()?;
-                Ok(Arc::new(s3))
-            }
-            "gs" => {
-                let gcs = GoogleCloudStorageBuilder::from_env()
-                    .with_url(url.as_str())
-                    .build()?;
-                Ok(Arc::new(gcs))
-            }
-            "az" | "abfs" | "abfss" => {
-                let azure = MicrosoftAzureBuilder::from_env()
-                    .with_url(url.as_str())
-                    .build()?;
-                Ok(Arc::new(azure))
-            }
             scheme => Err(Error::Generic {
                 store: "ObjectStoreRegistry",
-                source: format!("Unsupported URL scheme: {scheme}").into(),
+                source: format!("Unsupported object store scheme: {scheme}").into(),
             }),
         }
     }
@@ -204,26 +181,15 @@ impl GeoZarrClient {
                         source: "Invalid file URL path".into(),
                     })
                 })?;
-                icechunk::new_local_filesystem_storage(&path)
+                new_local_filesystem_storage(&path)
                     .await
                     .map_err(ZarrError::IcechunkStorageError)?
             }
-            "http" | "https" => {
-                // HttpBuilder expects the base URL (typically origin + path prefix)
-                todo!()
-            }
-            "s3" | "s3a" => {
-                todo!()
-            }
-            "gs" => {
-                todo!()
-            }
-            "az" | "abfs" | "abfss" => {
-                todo!()
-            }
+            "http" | "https" => new_http_storage(url.as_str(), None, None)
+                .map_err(ZarrError::IcechunkStorageError)?,
             scheme => Err(ZarrError::OjbectStoreError(Error::Generic {
                 store: "ObjectStoreRegistry",
-                source: format!("Unsupported URL scheme: {scheme}").into(),
+                source: format!("Unsupported object store scheme: {scheme}").into(),
             }))?,
         };
 
