@@ -578,6 +578,8 @@ pub(crate) fn select_best_level(
 #[cfg(test)]
 mod tests {
 
+    use zarrs::array::Array;
+
     use crate::test_utils::get_zarr_store;
 
     use super::*;

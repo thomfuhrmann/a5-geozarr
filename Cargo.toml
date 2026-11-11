@@ -1,5 +1,5 @@
 [package]
-name = "geozarr-client"
+name = "a5-geozarr"
 version = "0.1.0"
 edition = "2024"
 
