@@ -1,6 +1,7 @@
 use std::{collections::HashMap, hash::Hasher, sync::Arc, vec};
 
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use icechunk::{new_local_filesystem_storage, storage::new_http_storage};
 use ndarray::{Array2, ArrayD, Axis, Ix2};
 use object_store::{Error, ObjectStore, http::HttpBuilder, local::LocalFileSystem};
@@ -130,14 +131,14 @@ impl ChunkIndexKey {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct GeoZarrClient {
     /// One warp grid per spatial crs and spatial transform
-    pub warp_grids: HashMap<WarpCacheKey, WarpGrid>,
+    pub warp_grids: Arc<DashMap<WarpCacheKey, WarpGrid>>,
     /// Registry for zarr stores
-    pub store_registry: HashMap<Url, Arc<ZarrStore>>,
+    pub store_registry: Arc<DashMap<Url, Arc<ZarrStore>>>,
     /// Cache for mappings from coordinate values to chunk indices and offsets
-    pub chunk_indices: HashMap<ChunkIndexKey, ChunkIndex>,
+    pub chunk_indices: Arc<DashMap<ChunkIndexKey, ChunkIndex>>,
 }
 
 impl GeoZarrClient {
@@ -227,36 +228,30 @@ impl GeoZarrClient {
     }
 
     pub async fn get_or_build_store(
-        &mut self,
+        &self,
         url: &Url,
         virtual_chunks_url: Option<&Url>,
         store_type: StoreType,
     ) -> Result<Arc<ZarrStore>, ZarrError> {
-        match self.store_registry.get(url) {
-            Some(s) => Ok(Arc::clone(s)),
-            None => {
-                let new_store = match store_type {
-                    StoreType::Zarr => {
-                        let obj_store =
-                            Self::build_object_store(url).map_err(ZarrError::OjbectStoreError)?;
-                        let zarr_store =
-                            Arc::new(ZarrStore::Zarr(AsyncObjectStore::new(obj_store)));
-                        self.store_registry
-                            .insert(url.clone(), Arc::clone(&zarr_store));
-                        zarr_store
-                    }
-                    StoreType::Icechunk => {
-                        let zarr_store = Arc::new(ZarrStore::Icechunk(
-                            Self::build_icechunk_store(url, virtual_chunks_url).await?,
-                        ));
-                        self.store_registry
-                            .insert(url.clone(), Arc::clone(&zarr_store));
-                        zarr_store
-                    }
-                };
-                Ok(new_store)
-            }
+        if let Some(store) = self.store_registry.get(url) {
+            return Ok(Arc::clone(&store));
         }
+
+        let new_store = match store_type {
+            StoreType::Zarr => {
+                let obj_store =
+                    Self::build_object_store(url).map_err(ZarrError::OjbectStoreError)?;
+                Arc::new(ZarrStore::Zarr(AsyncObjectStore::new(obj_store)))
+            }
+            StoreType::Icechunk => Arc::new(ZarrStore::Icechunk(
+                Self::build_icechunk_store(url, virtual_chunks_url).await?,
+            )),
+        };
+
+        let entry = self.store_registry.entry(url.clone());
+        let stored_store = entry.or_insert(new_store);
+
+        Ok(Arc::clone(&stored_store))
     }
 
     pub async fn abs_offset(
@@ -266,7 +261,7 @@ impl GeoZarrClient {
         val: f64,
     ) -> Result<u64, ZarrError> {
         let data_type = array.data_type();
-        let index = self.chunk_indices.entry(key).or_default();
+        let mut index = self.chunk_indices.entry(key).or_default();
         let idx = if data_type.is::<Int64DataType>() {
             index.get_chunk_index(array, val as i64).await?
         } else if data_type.is::<Int32DataType>() {
@@ -462,7 +457,7 @@ impl GeoZarrClient {
         // initialize or update warp grid
         let key = WarpCacheKey(crs_str, spatial_transform);
         let bbox = {
-            let warp_grid = self.warp_grids.entry(key.clone()).or_default();
+            let mut warp_grid = self.warp_grids.entry(key.clone()).or_default();
             warp_grid.update_warp_grid(cell_ids, &geozarr_metadata)?
         };
 

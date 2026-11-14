@@ -56,7 +56,7 @@ impl ChunkLocation {
 }
 
 /// A cache for mappings from coordinate values to chunk indices and offsets
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ChunkIndex {
     cache: Cache<u64, ChunkLocation>,
 }
