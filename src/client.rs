@@ -36,6 +36,8 @@ use crate::{
     warp_grid::{TARGET_CRS, WarpGrid},
 };
 
+use crate::dispatch_arms;
+
 #[derive(Debug, Clone)]
 pub enum StoreType {
     Zarr,
@@ -346,6 +348,7 @@ impl GeoZarrClient {
             ));
         }
 
+        // Build Zarr store
         let zarr_store = self
             .get_or_build_store(url, virtual_chunks_url, store_type)
             .await?;
@@ -465,6 +468,17 @@ impl GeoZarrClient {
             "Missing warp grid (unexpected)".into(),
         ))?;
 
+        // TODO: return enum wrapper for different data types using downcast_ref on data_type to obtain proper ElementOwned
+        // dispatch_arms!(
+        //     self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices,
+        //     f32 => F32,
+        //     f64 => F64,
+        //     u32 => U32,
+        //     u64 => U64,
+        //     i32 => I32,
+        //     i64 => I64,
+        // );
+
         if let Some(bbox) = bbox {
             let data = self
                 .retrieve_array_subset(&array, bbox, dimension_names, spatial_dims, &dim_indices)
@@ -583,6 +597,55 @@ impl GeoZarrClient {
     }
 }
 
+/// Possible values that can be sampled from Zarr
+#[derive(Debug, Clone)]
+pub enum SampledData {
+    F32(Vec<Option<f32>>),
+    F64(Vec<Option<f64>>),
+    U32(Vec<Option<u32>>),
+    U64(Vec<Option<u64>>),
+    I32(Vec<Option<i32>>),
+    I64(Vec<Option<i64>>),
+}
+
+#[macro_export]
+macro_rules! dispatch_arms {
+    (
+        $self:ident, $array:ident, $cell_ids:ident, $warp_grid:ident,
+        $bbox:ident, $dimension_names:ident, $spatial_dims:ident, $dim_indices:ident,
+        $( $T:ty => $Variant:ident ),* $(,)?
+    ) => {
+        {
+            let data_type = $array.data_type();
+            $(
+                if data_type.is::<$T>() {
+                    let data = $self
+                        .retrieve_array_subset::<$T>(&$array, $bbox, $dimension_names, $spatial_dims, &$dim_indices)
+                        .await?;
+                    let sampled = $self
+                        .sample_at_warp_grid::<$T>($cell_ids, &$warp_grid, $bbox, &data)?;
+                    return Ok(SampledData::$Variant(sampled));
+                }
+            )*
+
+            Err($crate::error::ZarrError::DataTypeError(
+                format!("Unsupported data type: {:?}", data_type)
+            ))
+        }
+    };
+}
+
+// can be called this way:
+// dispatch_arms!(
+//     self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices,
+//     f32 => F32,
+//     f64 => F64,
+//     u32 => U32,
+//     u64 => U64,
+//     i32 => I32,
+//     i64 => I64,
+// )
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -669,6 +732,11 @@ mod tests {
         let client = GeoZarrClient::new();
         let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
             .expect("should load cell ids");
+        // let cells = Vec::from([
+        //     7680299144958705664,
+        //     7680299149253672960,
+        //     7680299150327414784,
+        // ]);
         let path = get_path("tests/fixtures/spartacus.icechunk.zarr");
         let url = Url::from_file_path(path).expect("should be valid");
         let virtual_chunks_url =
@@ -689,6 +757,7 @@ mod tests {
             )
             .await
             .expect("should fetch");
+        println!("{data:?}");
         assert_eq!(data.len(), cells.len());
     }
 }

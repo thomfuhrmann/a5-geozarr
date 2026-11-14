@@ -96,4 +96,7 @@ pub enum ZarrError {
     /// Icechunk virtual chunk container error
     #[error("Virtual chunk error: {0}")]
     VirtualChunkError(String),
+    /// Data type error
+    #[error("Data type error: {0}")]
+    DataTypeError(String),
 }
