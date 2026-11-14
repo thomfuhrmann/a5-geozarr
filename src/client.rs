@@ -255,7 +255,7 @@ impl GeoZarrClient {
     }
 
     pub async fn abs_offset(
-        &mut self,
+        &self,
         array: &Array<ZarrStore>,
         key: ChunkIndexKey,
         val: f64,
@@ -284,7 +284,7 @@ impl GeoZarrClient {
 
     // Find array indices for non-spatial coordinates
     pub async fn load_dim_indices(
-        &mut self,
+        &self,
         zarr_store: Arc<ZarrStore>,
         url: &Url,
         asset_path: &NodePath,
@@ -332,7 +332,7 @@ impl GeoZarrClient {
 
     /// Retrieve data for given cells
     pub async fn fetch_data<T: ElementOwned>(
-        &mut self,
+        &self,
         url: &Url,
         cell_ids: &[u64],
         data_var_name: &str,
@@ -602,7 +602,7 @@ mod tests {
             .join(asset_suffix)
             .map_err(ZarrError::NodePathError)
             .expect("should load asset path");
-        let mut client = GeoZarrClient::new();
+        let client = GeoZarrClient::new();
         let query_coords = QueryCoordsBuilder::new()
             .temporal_dim_str("time", "2014-12-31T12:00:00Z")
             .expect("should parse")
@@ -623,7 +623,7 @@ mod tests {
     // 2014-12-31T12:00:00Z, 2014-12-31T18:00:00Z
     #[tokio::test]
     async fn test_fetch_1() {
-        let mut client = GeoZarrClient::new();
+        let client = GeoZarrClient::new();
         let cells = read_cell_ids(Path::new("tests/fixtures/pyramid_cells.csv"))
             .expect("should load cell ids");
         let path = get_path("tests/fixtures/pyramid.zarr");
@@ -641,7 +641,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_2() {
-        let mut client = GeoZarrClient::new();
+        let client = GeoZarrClient::new();
         let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
             .expect("should load cell ids");
         let path = get_path("tests/fixtures/snowgrid.zarr");
@@ -666,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_3() {
-        let mut client = GeoZarrClient::new();
+        let client = GeoZarrClient::new();
         let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
             .expect("should load cell ids");
         let path = get_path("tests/fixtures/spartacus.icechunk.zarr");
