@@ -264,18 +264,18 @@ impl GeoZarrClient {
     ) -> Result<u64, ZarrError> {
         let data_type = array.data_type();
         let mut index = self.chunk_indices.entry(key).or_default();
-        let idx = if data_type.is::<Int64DataType>() {
-            index.get_chunk_index(array, val as i64).await?
-        } else if data_type.is::<Int32DataType>() {
+        let idx = if data_type.is::<Int32DataType>() {
             index.get_chunk_index(array, val as i32).await?
-        } else if data_type.is::<UInt64DataType>() {
-            index.get_chunk_index(array, val as u64).await?
+        } else if data_type.is::<Int64DataType>() {
+            index.get_chunk_index(array, val as i64).await?
         } else if data_type.is::<UInt32DataType>() {
             index.get_chunk_index(array, val as u32).await?
-        } else if data_type.is::<Float64DataType>() {
-            index.get_chunk_index(array, val).await?
+        } else if data_type.is::<UInt64DataType>() {
+            index.get_chunk_index(array, val as u64).await?
         } else if data_type.is::<Float32DataType>() {
             index.get_chunk_index(array, val as f32).await?
+        } else if data_type.is::<Float64DataType>() {
+            index.get_chunk_index(array, val as f64).await?
         } else {
             return Err(ZarrError::CastError(format!(
                 "Unsupported data type: {data_type}"
@@ -333,7 +333,7 @@ impl GeoZarrClient {
     }
 
     /// Retrieve data for given cells
-    pub async fn fetch_data<T: ElementOwned>(
+    pub async fn fetch_data(
         &self,
         url: &Url,
         cell_ids: &[u64],
@@ -341,7 +341,7 @@ impl GeoZarrClient {
         query_coords: &QueryCoords,
         store_type: StoreType,
         virtual_chunks_url: Option<&Url>,
-    ) -> Result<Vec<Option<T>>, ZarrError> {
+    ) -> Result<SampledData, ZarrError> {
         if cell_ids.is_empty() {
             return Err(ZarrError::ParameterError(
                 "Must provide at least one cell id".into(),
@@ -468,25 +468,18 @@ impl GeoZarrClient {
             "Missing warp grid (unexpected)".into(),
         ))?;
 
-        // TODO: return enum wrapper for different data types using downcast_ref on data_type to obtain proper ElementOwned
-        // dispatch_arms!(
-        //     self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices,
-        //     f32 => F32,
-        //     f64 => F64,
-        //     u32 => U32,
-        //     u64 => U64,
-        //     i32 => I32,
-        //     i64 => I64,
-        // );
-
         if let Some(bbox) = bbox {
-            let data = self
-                .retrieve_array_subset(&array, bbox, dimension_names, spatial_dims, &dim_indices)
-                .await?;
-            let sampled_data = self.sample_at_warp_grid(cell_ids, &warp_grid, bbox, &data)?;
-            Ok(sampled_data)
+            dispatch_arms!(
+                self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices,
+                Float32DataType => (f32, F32),
+                Float64DataType => (f64, F64),
+                UInt32DataType => (u32, U32),
+                UInt64DataType => (u64, U64),
+                Int32DataType => (i32, I32),
+                Int64DataType => (i64, I64),
+            )
         } else {
-            Ok(vec![None; cell_ids.len()])
+            Ok(SampledData::None)
         }
     }
 
@@ -600,6 +593,7 @@ impl GeoZarrClient {
 /// Possible values that can be sampled from Zarr
 #[derive(Debug, Clone)]
 pub enum SampledData {
+    None,
     F32(Vec<Option<f32>>),
     F64(Vec<Option<f64>>),
     U32(Vec<Option<u32>>),
@@ -611,19 +605,19 @@ pub enum SampledData {
 #[macro_export]
 macro_rules! dispatch_arms {
     (
-        $self:ident, $array:ident, $cell_ids:ident, $warp_grid:ident,
-        $bbox:ident, $dimension_names:ident, $spatial_dims:ident, $dim_indices:ident,
-        $( $T:ty => $Variant:ident ),* $(,)?
+        $self:expr, $array:expr, $cell_ids:expr, $warp_grid:expr,
+        $bbox:expr, $dimension_names:expr, $spatial_dims:expr, $dim_indices:expr,
+        $( $T:ty => ($numeric_type:ty, $Variant:ident) ),* $(,)?
     ) => {
         {
             let data_type = $array.data_type();
             $(
                 if data_type.is::<$T>() {
                     let data = $self
-                        .retrieve_array_subset::<$T>(&$array, $bbox, $dimension_names, $spatial_dims, &$dim_indices)
+                        .retrieve_array_subset::<$numeric_type>(&$array, $bbox, $dimension_names, $spatial_dims, &$dim_indices)
                         .await?;
                     let sampled = $self
-                        .sample_at_warp_grid::<$T>($cell_ids, &$warp_grid, $bbox, &data)?;
+                        .sample_at_warp_grid::<$numeric_type>($cell_ids, &$warp_grid, $bbox, &data)?;
                     return Ok(SampledData::$Variant(sampled));
                 }
             )*
@@ -634,17 +628,6 @@ macro_rules! dispatch_arms {
         }
     };
 }
-
-// can be called this way:
-// dispatch_arms!(
-//     self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices,
-//     f32 => F32,
-//     f64 => F64,
-//     u32 => U32,
-//     u64 => U64,
-//     i32 => I32,
-//     i64 => I64,
-// )
 
 #[cfg(test)]
 mod tests {
@@ -696,10 +679,14 @@ mod tests {
             .expect("should parse")
             .build();
         let data = client
-            .fetch_data::<f64>(&url, &cells, "air", &query_coords, StoreType::Zarr, None)
+            .fetch_data(&url, &cells, "air", &query_coords, StoreType::Zarr, None)
             .await
             .expect("should fetch");
-        assert_eq!(data.len(), cells.len());
+
+        match data {
+            SampledData::F64(data) => assert_eq!(data.len(), cells.len()),
+            _ => panic!("wrong data type"),
+        }
     }
 
     #[tokio::test]
@@ -714,7 +701,7 @@ mod tests {
             .expect("should parse")
             .build();
         let data = client
-            .fetch_data::<f32>(
+            .fetch_data(
                 &url,
                 &cells,
                 "liquid_water",
@@ -724,7 +711,10 @@ mod tests {
             )
             .await
             .expect("should fetch");
-        assert_eq!(data.len(), cells.len());
+        match data {
+            SampledData::F32(data) => assert_eq!(data.len(), cells.len()),
+            _ => panic!("wrong data type"),
+        }
     }
 
     #[tokio::test]
@@ -747,7 +737,7 @@ mod tests {
             .other_dim("z", 0)
             .build();
         let data = client
-            .fetch_data::<i32>(
+            .fetch_data(
                 &url,
                 &cells,
                 "TM",
@@ -757,7 +747,9 @@ mod tests {
             )
             .await
             .expect("should fetch");
-        println!("{data:?}");
-        assert_eq!(data.len(), cells.len());
+        match data {
+            SampledData::I32(data) => assert_eq!(data.len(), cells.len()),
+            _ => panic!("wrong data type"),
+        }
     }
 }
