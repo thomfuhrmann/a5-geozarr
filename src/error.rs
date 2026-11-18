@@ -99,4 +99,10 @@ pub enum ZarrError {
     /// Data type error
     #[error("Data type error: {0}")]
     DataTypeError(String),
+    /// Coordinate error
+    #[error("Coordinate error: {0}")]
+    CoordinateError(String),
+    /// Shape error
+    #[error("Shape error: {0}")]
+    ShapeError(ndarray::ShapeError),
 }

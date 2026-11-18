@@ -1,11 +1,15 @@
-use std::{collections::HashMap, hash::Hasher, sync::Arc, vec};
+use std::{
+    collections::HashMap,
+    hash::Hasher,
+    ops::{Range, RangeFull},
+    sync::Arc,
+    vec,
+};
 
-use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use icechunk::{new_local_filesystem_storage, storage::new_http_storage};
-use ndarray::{Array2, ArrayD, Axis, Ix2};
+use ndarray::{Array2, ArrayD, Axis, Ix2, IxDyn, Slice, SliceInfo, SliceInfoElem};
 use object_store::{Error, ObjectStore, http::HttpBuilder, local::LocalFileSystem};
-use serde::{Deserialize, Serialize};
 use url::Url;
 use zarrs::{
     array::{
@@ -27,12 +31,13 @@ use zarrs_icechunk::{
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::{
-    dimension::{ChunkIndex, DimMeta},
+    dimension::{CacheKey, ChunkIndex, DimMeta},
     error::ZarrError,
     geozarr::{
         GeozarrMetadata, calculate_resolution_levels, get_proj, get_spatial_dims,
         get_spatial_dims_indices, native_cell_res, select_best_level, zarr_nodes,
     },
+    query::{CoordValue, QueryCoords, QuerySelection},
     store::ZarrStore,
     warp_grid::{TARGET_CRS, WarpGrid},
 };
@@ -68,59 +73,6 @@ impl std::hash::Hash for WarpCacheKey {
         for val in &self.1 {
             val.to_bits().hash(state);
         }
-    }
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-pub struct QueryCoords {
-    temporal_dims: HashMap<String, DateTime<Utc>>,
-    other_dims: HashMap<String, f64>,
-}
-
-pub struct QueryCoordsBuilder {
-    temporal_dims: HashMap<String, DateTime<Utc>>,
-    other_dims: HashMap<String, f64>,
-}
-
-impl QueryCoordsBuilder {
-    pub fn new() -> Self {
-        Self {
-            temporal_dims: HashMap::new(),
-            other_dims: HashMap::new(),
-        }
-    }
-
-    pub fn temporal_dim<S: Into<String>>(mut self, name: S, dt: DateTime<Utc>) -> Self {
-        self.temporal_dims.insert(name.into(), dt);
-        self
-    }
-
-    pub fn temporal_dim_str<S1: Into<String>, S2: Into<String>>(
-        mut self,
-        name: S1,
-        rfc3339: S2,
-    ) -> Result<Self, chrono::ParseError> {
-        let dt = DateTime::parse_from_rfc3339(&rfc3339.into())?.with_timezone(&Utc);
-        self.temporal_dims.insert(name.into(), dt);
-        Ok(self)
-    }
-
-    pub fn other_dim<S1: Into<String>, S2: Into<f64>>(mut self, key: S1, value: S2) -> Self {
-        self.other_dims.insert(key.into(), value.into());
-        self
-    }
-
-    pub fn build(self) -> QueryCoords {
-        QueryCoords {
-            temporal_dims: self.temporal_dims,
-            other_dims: self.other_dims,
-        }
-    }
-}
-
-impl Default for QueryCoordsBuilder {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -257,80 +209,89 @@ impl GeoZarrClient {
         Ok(Arc::clone(&stored_store))
     }
 
-    pub async fn abs_offset(
-        &self,
-        array: &Array<ZarrStore>,
-        key: ChunkIndexKey,
-        val: f64,
-    ) -> Result<u64, ZarrError> {
-        let data_type = array.data_type();
-        let mut index = self.chunk_indices.entry(key).or_default();
-        let idx = if data_type.is::<Int32DataType>() {
-            index.get_chunk_index(array, val as i32).await?
-        } else if data_type.is::<Int64DataType>() {
-            index.get_chunk_index(array, val as i64).await?
-        } else if data_type.is::<UInt32DataType>() {
-            index.get_chunk_index(array, val as u32).await?
-        } else if data_type.is::<UInt64DataType>() {
-            index.get_chunk_index(array, val as u64).await?
-        } else if data_type.is::<Float32DataType>() {
-            index.get_chunk_index(array, val as f32).await?
-        } else if data_type.is::<Float64DataType>() {
-            index.get_chunk_index(array, val as f64).await?
-        } else {
-            return Err(ZarrError::CastError(format!(
-                "Unsupported data type: {data_type}"
-            )));
-        };
-        Ok(idx)
-    }
-
     // Find array indices for non-spatial coordinates
     pub async fn load_dim_indices(
         &self,
         zarr_store: Arc<ZarrStore>,
         url: &Url,
         asset_path: &NodePath,
-        query_coords: &QueryCoords,
-    ) -> Result<HashMap<String, u64>, ZarrError> {
+        query_coords: QueryCoords,
+    ) -> Result<HashMap<String, Range<u64>>, ZarrError> {
         let mut dims_index = HashMap::new();
 
-        // Process temporal dimensions
-        for (dim_name, val) in &query_coords.temporal_dims {
+        // process dimensions
+        for (dim_name, sel) in query_coords {
             let dim_path = asset_path
-                .join(dim_name)
+                .join(&dim_name)
                 .map_err(ZarrError::NodePathError)?;
             let key = ChunkIndexKey::new(url.clone(), dim_path.clone());
-            let offset = match Array::async_open(Arc::clone(&zarr_store), dim_path.as_str()).await {
+            let range = match Array::async_open(Arc::clone(&zarr_store), dim_path.as_str()).await {
                 Ok(array) => {
-                    let meta = DimMeta::get_metadata(dim_name, &array)?;
-                    if let DimMeta::Time(meta) = &meta {
-                        let raw = meta.datetime_to_raw(val);
-                        self.abs_offset(&array, key, raw).await?
-                    } else {
-                        0
+                    let meta = DimMeta::get_metadata(&dim_name, &array)?;
+                    match sel {
+                        QuerySelection::Point(coord) => {
+                            let offset = self.abs_offset(&array, key, coord, meta).await?;
+                            offset..(offset + 1)
+                        }
+                        QuerySelection::Range { start, end } => match (start, end) {
+                            (Some(start), Some(end)) => {
+                                let start = self.abs_offset(&array, key, start, meta).await?;
+                                let end = self.abs_offset(&array, key, end, meta).await?;
+                                start..end
+                            }
+                            (Some(start), None) => {
+                                let start = self.abs_offset(&array, key, start, meta).await?;
+                                let end = array.shape()[0];
+                                start..end
+                            }
+                            (None, Some(end)) => {
+                                let start = 0;
+                                let end = self.abs_offset(&array, key, end, meta).await?;
+                                start..end
+                            }
+                            (None, None) => {
+                                let start = 0;
+                                let end = array.shape()[0];
+                                start..end
+                            }
+                        },
                     }
                 }
                 // if dimension is present in data variable but no physical array is present
-                Err(_) => 0,
+                Err(_) => 0..1,
             };
-            dims_index.insert(dim_name.clone(), offset);
-        }
 
-        // Process other dimensions
-        for (dim_name, val) in &query_coords.other_dims {
-            let dim_path = asset_path
-                .join(dim_name)
-                .map_err(ZarrError::NodePathError)?;
-            let key = ChunkIndexKey::new(url.clone(), dim_path.clone());
-            let offset = match Array::async_open(Arc::clone(&zarr_store), dim_path.as_str()).await {
-                Ok(array) => self.abs_offset(&array, key, *val).await?,
-                Err(_) => 0,
-            };
-            dims_index.insert(dim_name.clone(), offset);
+            dims_index.insert(dim_name.clone(), range);
         }
 
         Ok(dims_index)
+    }
+
+    pub async fn abs_offset(
+        &self,
+        array: &Array<ZarrStore>,
+        key: ChunkIndexKey,
+        val: CoordValue,
+        meta: DimMeta,
+    ) -> Result<u64, ZarrError> {
+        let mut index = self.chunk_indices.entry(key).or_default();
+        match val {
+            CoordValue::Temporal(val) => {
+                let DimMeta::Time(meta) = meta else {
+                    return Err(ZarrError::AttributeError(
+                        "Missing metadata for time array".into(),
+                    ));
+                };
+                let raw = meta.datetime_to_raw(&val);
+                index.get_chunk_index(&array, raw).await
+            }
+            CoordValue::F32(val) => index.get_chunk_index(&array, val).await,
+            CoordValue::F64(val) => index.get_chunk_index(&array, val).await,
+            CoordValue::I32(val) => index.get_chunk_index(&array, val).await,
+            CoordValue::I64(val) => index.get_chunk_index(&array, val).await,
+            CoordValue::U32(val) => index.get_chunk_index(&array, val).await,
+            CoordValue::U64(val) => index.get_chunk_index(&array, val).await,
+        }
     }
 
     /// Retrieve data for given cells
@@ -339,7 +300,7 @@ impl GeoZarrClient {
         url: &Url,
         cell_ids: &[u64],
         data_var_name: &str,
-        query_coords: &QueryCoords,
+        query_coords: QueryCoords,
         store_type: StoreType,
         virtual_chunks_url: Option<&Url>,
     ) -> Result<SampledData, ZarrError> {
@@ -490,8 +451,8 @@ impl GeoZarrClient {
         bbox: [u64; 4],
         dimension_names: &[Option<String>],
         spatial_dims: &[String],
-        dim_indices: &HashMap<String, u64>,
-    ) -> Result<Array2<T>, ZarrError> {
+        dim_indices: &HashMap<String, Range<u64>>,
+    ) -> Result<ArrayD<T>, ZarrError> {
         let x_end = bbox[2]
             .checked_add(1)
             .ok_or_else(|| ZarrError::DimensionError("x range overflow".into()))?;
@@ -505,8 +466,8 @@ impl GeoZarrClient {
             .iter()
             .flatten()
             .filter_map(|name| {
-                if let Some(&idx) = dim_indices.get(name) {
-                    return Some(idx..idx + 1);
+                if let Some(idx) = dim_indices.get(name) {
+                    return Some(idx.clone());
                 }
 
                 match spatial_dims.iter().position(|s| s == name.as_str()) {
@@ -517,39 +478,12 @@ impl GeoZarrClient {
             })
             .collect();
 
-        let full_subset = array
+        let subset = array
             .async_retrieve_array_subset::<ArrayD<T>>(&ranges)
             .await
             .map_err(ZarrError::ArrayError)?;
 
-        // remove non-spatial axis
-        let spatial_indices = get_spatial_dims_indices(spatial_dims, dimension_names)?;
-        let mut squeezed = full_subset;
-        for idx in (0..dimension_names.len()).rev() {
-            if !spatial_indices.contains(&idx) {
-                squeezed = squeezed.remove_axis(Axis(idx));
-            }
-        }
-
-        // possibly reorder coordinate axis
-        let array_data = if spatial_indices[0] < spatial_indices[1] {
-            // already in [y, x] orientation
-            squeezed
-                .into_dimensionality::<Ix2>()
-                .map_err(|_shape_error| {
-                    ZarrError::DimensionError("Expected exactly 2 remaining dimensions".to_owned())
-                })?
-        } else {
-            // array is in [x, y] orientation - transpose into [y, x]
-            squeezed
-                .into_dimensionality::<Ix2>()
-                .map_err(|_shape_error| {
-                    ZarrError::DimensionError("Expected exactly 2 remaining dimensions".to_owned())
-                })?
-                .reversed_axes()
-        };
-
-        Ok(array_data)
+        Ok(subset)
     }
 
     /// Sample the data at cell centers using a warp grid
@@ -558,7 +492,8 @@ impl GeoZarrClient {
         cell_ids: &[u64],
         warp_grid: &WarpGrid,
         bbox: [u64; 4],
-        array: &Array2<T>,
+        array: &ArrayD<T>,
+        spatial_indices: &[usize],
     ) -> Result<Vec<Option<T>>, ZarrError> {
         let mut sampled_data = vec![None; cell_ids.len()];
 
@@ -582,12 +517,42 @@ impl GeoZarrClient {
                 if rel_right >= 0 && rel_right < width && rel_down >= 0 && rel_down < height {
                     let r = rel_down as usize;
                     let c = rel_right as usize;
+                    let map = spatial_indices
+                        .iter()
+                        .cloned()
+                        .zip([r, c].into_iter())
+                        .collect::<HashMap<_, _>>();
+                    let sample = Self::sample_at_axes(array, &map);
                     sampled_data[idx] = Some(array[[r, c]].clone());
                 }
             }
         }
 
         Ok(sampled_data)
+    }
+
+    fn sample_at_axes<T: Clone>(
+        array: &ArrayD<T>,
+        fixed_indices: &HashMap<usize, usize>, // maps axis -> index
+    ) -> Result<ArrayD<T>, ZarrError> {
+        let ndim = array.ndim();
+        let mut elems = Vec::with_capacity(ndim);
+
+        for axis in 0..ndim {
+            if let Some(&idx) = fixed_indices.get(&axis) {
+                // Fix this axis to a specific point index
+                // This drops the dimension from the resulting view
+                elems.push(SliceInfoElem::Index(idx as isize));
+            } else {
+                // Keep the entire axis
+                elems.push(SliceInfoElem::from(Slice::from(RangeFull)));
+            }
+        }
+
+        let slice_info =
+            SliceInfo::<_, IxDyn, IxDyn>::try_from(elems).map_err(ZarrError::ShapeError)?;
+
+        Ok(array.slice(slice_info).to_owned())
     }
 }
 
@@ -635,7 +600,10 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::test_utils::{get_path, get_zarr_store, read_cell_ids};
+    use crate::{
+        query::QueryCoordsBuilder,
+        test_utils::{get_path, get_zarr_store, read_cell_ids},
+    };
 
     #[tokio::test]
     async fn test_load_dim_coords() -> Result<(), ZarrError> {

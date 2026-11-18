@@ -35,30 +35,10 @@ macro_rules! impl_integer_cache_key {
 
 impl_integer_cache_key!(i32, i64, u32, u64);
 
-/// Location of a coordinate value as chunk index plus offset
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChunkLocation {
-    pub chunk_index: u64,
-    pub chunk_offset: u64,
-}
-
-impl ChunkLocation {
-    pub fn new(chunk_index: u64, chunk_offset: u64) -> Self {
-        Self {
-            chunk_index,
-            chunk_offset,
-        }
-    }
-
-    pub fn absolute_offset(&self, chunk_size: u64) -> u64 {
-        (self.chunk_index * chunk_size) + self.chunk_offset
-    }
-}
-
-/// A cache for mappings from coordinate values to chunk indices and offsets
+/// A cache for mappings from coordinate values to offsets
 #[derive(Debug, Clone)]
 pub struct ChunkIndex {
-    cache: Cache<u64, ChunkLocation>,
+    cache: Cache<u64, u64>,
 }
 
 impl Default for ChunkIndex {
@@ -82,24 +62,23 @@ impl ChunkIndex {
         val: T,
     ) -> Result<u64, ZarrError> {
         let key = val.clone().to_cache_key();
-        let chunk_size = u64::from(coords.chunk_shape(&[0]).map_err(ZarrError::ArrayError)?[0]);
         if let Some(loc) = self.cache.get(&key) {
-            Ok(loc.absolute_offset(chunk_size))
+            Ok(loc)
         } else {
-            let loc = Self::find_chunk_location(coords, val).await?;
-            self.cache.insert(key, loc.clone());
-            Ok(loc.absolute_offset(chunk_size))
+            let loc = Self::find_absolute_offset(coords, val).await?;
+            self.cache.insert(key, loc);
+            Ok(loc)
         }
     }
 
-    async fn find_chunk_location<T: CacheKey + ElementOwned + PartialOrd>(
+    /// TODO: fast path for uniform chunk size, otherwise use non-uniform chunk sizes
+    async fn find_absolute_offset<T: ElementOwned + PartialOrd>(
         coords: &Array<ZarrStore>,
         val: T,
-    ) -> Result<ChunkLocation, ZarrError> {
+    ) -> Result<u64, ZarrError> {
         let shape = coords.shape();
         let total_len = shape[0];
 
-        // Get chunk size for the dimension
         let chunk_shape = coords.chunk_shape(&[0]).map_err(ZarrError::ArrayError)?;
         let chunk_size = u64::from(chunk_shape[0]);
 
@@ -108,11 +87,9 @@ impl ChunkIndex {
         let mut low_chunk = 0;
         let mut high_chunk = total_chunks - 1;
 
-        // Binary search to find the exact chunk containing 'val'
         while low_chunk <= high_chunk {
             let mid_chunk = low_chunk + (high_chunk - low_chunk) / 2;
 
-            // Retrieve the chunk data
             let chunk = coords
                 .async_retrieve_chunk::<Vec<T>>(&[mid_chunk])
                 .await
@@ -129,21 +106,19 @@ impl ChunkIndex {
 
             if val < *chunk_start_val {
                 if mid_chunk == 0 {
-                    // Value is smaller than the first coordinate in the array
-                    return Ok(ChunkLocation::new(0, 0));
+                    return Ok(0);
                 }
                 high_chunk = mid_chunk - 1;
             } else if val > *chunk_end_val {
                 low_chunk = mid_chunk + 1;
             } else {
-                // The value lies within this chunk! Find exact local offset.
-                // We can binary search or scan locally within the chunk vector.
-                let offset = chunk
+                let local_offset = chunk
                     .iter()
                     .position(|x| x >= &val)
                     .unwrap_or(chunk.len() - 1) as u64;
 
-                return Ok(ChunkLocation::new(mid_chunk, offset));
+                let absolute_offset = (mid_chunk * chunk_size) + local_offset;
+                return Ok(absolute_offset.min(total_len - 1));
             }
         }
 

@@ -4,6 +4,7 @@ pub mod codecs;
 pub mod dimension;
 pub mod error;
 pub mod geozarr;
+pub mod query;
 pub mod store;
 #[cfg(test)]
 pub mod test_utils;
