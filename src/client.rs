@@ -5,6 +5,7 @@ use dashmap::DashMap;
 use icechunk::{new_local_filesystem_storage, storage::new_http_storage};
 use ndarray::{Array2, ArrayD, Axis, Ix2};
 use object_store::{Error, ObjectStore, http::HttpBuilder, local::LocalFileSystem};
+use serde::{Deserialize, Serialize};
 use url::Url;
 use zarrs::{
     array::{
@@ -70,7 +71,7 @@ impl std::hash::Hash for WarpCacheKey {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct QueryCoords {
     temporal_dims: HashMap<String, DateTime<Utc>>,
     other_dims: HashMap<String, f64>,
@@ -722,25 +723,19 @@ mod tests {
         let client = GeoZarrClient::new();
         let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
             .expect("should load cell ids");
-        // let cells = Vec::from([
-        //     7680299144958705664,
-        //     7680299149253672960,
-        //     7680299150327414784,
-        // ]);
         let path = get_path("tests/fixtures/spartacus.icechunk.zarr");
         let url = Url::from_file_path(path).expect("should be valid");
         let virtual_chunks_url =
             Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
         let query_coords = QueryCoordsBuilder::new()
-            .temporal_dim_str("time", "2026-10-01T00:00:00Z")
+            .temporal_dim_str("time", "2025-10-01T00:00:00Z")
             .expect("should parse")
-            .other_dim("z", 0)
             .build();
         let data = client
             .fetch_data(
                 &url,
                 &cells,
-                "TM",
+                "RR",
                 &query_coords,
                 StoreType::Icechunk,
                 Some(&virtual_chunks_url),
@@ -748,7 +743,9 @@ mod tests {
             .await
             .expect("should fetch");
         match data {
-            SampledData::I32(data) => assert_eq!(data.len(), cells.len()),
+            SampledData::I32(data) => {
+                assert_eq!(data.len(), cells.len())
+            }
             _ => panic!("wrong data type"),
         }
     }
