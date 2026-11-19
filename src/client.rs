@@ -8,7 +8,7 @@ use std::{
 
 use dashmap::DashMap;
 use icechunk::{new_local_filesystem_storage, storage::new_http_storage};
-use ndarray::{Array2, ArrayD, Axis, Ix2, IxDyn, Slice, SliceInfo, SliceInfoElem};
+use ndarray::{ArrayD, IxDyn, Slice, SliceInfo, SliceInfoElem};
 use object_store::{Error, ObjectStore, http::HttpBuilder, local::LocalFileSystem};
 use url::Url;
 use zarrs::{
@@ -31,13 +31,13 @@ use zarrs_icechunk::{
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::{
-    dimension::{CacheKey, ChunkIndex, DimMeta},
+    dimension::{ChunkIndex, DimMeta},
     error::ZarrError,
     geozarr::{
         GeozarrMetadata, calculate_resolution_levels, get_proj, get_spatial_dims,
         get_spatial_dims_indices, native_cell_res, select_best_level, zarr_nodes,
     },
-    query::{CoordValue, QueryCoords, QuerySelection},
+    query::{CoordValue, QuerySelection},
     store::ZarrStore,
     warp_grid::{TARGET_CRS, WarpGrid},
 };
@@ -215,7 +215,7 @@ impl GeoZarrClient {
         zarr_store: Arc<ZarrStore>,
         url: &Url,
         asset_path: &NodePath,
-        query_coords: QueryCoords,
+        query_coords: HashMap<String, QuerySelection>,
     ) -> Result<HashMap<String, Range<u64>>, ZarrError> {
         let mut dims_index = HashMap::new();
 
@@ -235,7 +235,9 @@ impl GeoZarrClient {
                         }
                         QuerySelection::Range { start, end } => match (start, end) {
                             (Some(start), Some(end)) => {
-                                let start = self.abs_offset(&array, key, start, meta).await?;
+                                let start = self
+                                    .abs_offset(&array, key.clone(), start, meta.clone())
+                                    .await?;
                                 let end = self.abs_offset(&array, key, end, meta).await?;
                                 start..end
                             }
@@ -275,7 +277,9 @@ impl GeoZarrClient {
         meta: DimMeta,
     ) -> Result<u64, ZarrError> {
         let mut index = self.chunk_indices.entry(key).or_default();
-        match val {
+        let data_type = array.data_type();
+        let coerced = val.coerce_to(data_type)?;
+        match coerced {
             CoordValue::Temporal(val) => {
                 let DimMeta::Time(meta) = meta else {
                     return Err(ZarrError::AttributeError(
@@ -283,7 +287,23 @@ impl GeoZarrClient {
                     ));
                 };
                 let raw = meta.datetime_to_raw(&val);
-                index.get_chunk_index(&array, raw).await
+                if data_type.is::<Float32DataType>() {
+                    index.get_chunk_index(&array, raw as f32).await
+                } else if data_type.is::<Float64DataType>() {
+                    index.get_chunk_index(&array, raw as f64).await
+                } else if data_type.is::<Int32DataType>() {
+                    index.get_chunk_index(&array, raw as i32).await
+                } else if data_type.is::<Int64DataType>() {
+                    index.get_chunk_index(&array, raw as i64).await
+                } else if data_type.is::<UInt32DataType>() {
+                    index.get_chunk_index(&array, raw as u32).await
+                } else if data_type.is::<UInt64DataType>() {
+                    index.get_chunk_index(&array, raw as u64).await
+                } else {
+                    return Err(ZarrError::DataTypeError(format!(
+                        "Unsupported data type: {data_type}"
+                    )));
+                }
             }
             CoordValue::F32(val) => index.get_chunk_index(&array, val).await,
             CoordValue::F64(val) => index.get_chunk_index(&array, val).await,
@@ -300,7 +320,7 @@ impl GeoZarrClient {
         url: &Url,
         cell_ids: &[u64],
         data_var_name: &str,
-        query_coords: QueryCoords,
+        query_coords: HashMap<String, QuerySelection>,
         store_type: StoreType,
         virtual_chunks_url: Option<&Url>,
     ) -> Result<SampledData, ZarrError> {
@@ -430,9 +450,11 @@ impl GeoZarrClient {
             "Missing warp grid (unexpected)".into(),
         ))?;
 
+        let spatial_indices = get_spatial_dims_indices(spatial_dims, dimension_names)?;
+
         if let Some(bbox) = bbox {
             dispatch_arms!(
-                self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices,
+                self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices, spatial_indices,
                 Float32DataType => (f32, F32),
                 Float64DataType => (f64, F64),
                 UInt32DataType => (u32, U32),
@@ -494,7 +516,7 @@ impl GeoZarrClient {
         bbox: [u64; 4],
         array: &ArrayD<T>,
         spatial_indices: &[usize],
-    ) -> Result<Vec<Option<T>>, ZarrError> {
+    ) -> Result<Vec<Option<ArrayD<T>>>, ZarrError> {
         let mut sampled_data = vec![None; cell_ids.len()];
 
         let xmin = bbox[0] as i64;
@@ -515,15 +537,13 @@ impl GeoZarrClient {
                 let rel_down = down - ymin;
 
                 if rel_right >= 0 && rel_right < width && rel_down >= 0 && rel_down < height {
-                    let r = rel_down as usize;
-                    let c = rel_right as usize;
                     let map = spatial_indices
                         .iter()
                         .cloned()
-                        .zip([r, c].into_iter())
+                        .zip([rel_down as usize, rel_right as usize].into_iter())
                         .collect::<HashMap<_, _>>();
-                    let sample = Self::sample_at_axes(array, &map);
-                    sampled_data[idx] = Some(array[[r, c]].clone());
+                    let sample = Self::slice_at_point(array, &map)?;
+                    sampled_data[idx] = Some(sample);
                 }
             }
         }
@@ -531,7 +551,7 @@ impl GeoZarrClient {
         Ok(sampled_data)
     }
 
-    fn sample_at_axes<T: Clone>(
+    fn slice_at_point<T: Clone>(
         array: &ArrayD<T>,
         fixed_indices: &HashMap<usize, usize>, // maps axis -> index
     ) -> Result<ArrayD<T>, ZarrError> {
@@ -560,19 +580,19 @@ impl GeoZarrClient {
 #[derive(Debug, Clone)]
 pub enum SampledData {
     None,
-    F32(Vec<Option<f32>>),
-    F64(Vec<Option<f64>>),
-    U32(Vec<Option<u32>>),
-    U64(Vec<Option<u64>>),
-    I32(Vec<Option<i32>>),
-    I64(Vec<Option<i64>>),
+    F32(Vec<Option<ArrayD<f32>>>),
+    F64(Vec<Option<ArrayD<f64>>>),
+    U32(Vec<Option<ArrayD<u32>>>),
+    U64(Vec<Option<ArrayD<u64>>>),
+    I32(Vec<Option<ArrayD<i32>>>),
+    I64(Vec<Option<ArrayD<i64>>>),
 }
 
 #[macro_export]
 macro_rules! dispatch_arms {
     (
         $self:expr, $array:expr, $cell_ids:expr, $warp_grid:expr,
-        $bbox:expr, $dimension_names:expr, $spatial_dims:expr, $dim_indices:expr,
+        $bbox:expr, $dimension_names:expr, $spatial_dims:expr, $dim_indices:expr, $spatial_dims_indices:expr,
         $( $T:ty => ($numeric_type:ty, $Variant:ident) ),* $(,)?
     ) => {
         {
@@ -583,7 +603,7 @@ macro_rules! dispatch_arms {
                         .retrieve_array_subset::<$numeric_type>(&$array, $bbox, $dimension_names, $spatial_dims, &$dim_indices)
                         .await?;
                     let sampled = $self
-                        .sample_at_warp_grid::<$numeric_type>($cell_ids, &$warp_grid, $bbox, &data)?;
+                        .sample_at_warp_grid::<$numeric_type>($cell_ids, &$warp_grid, $bbox, &data, &$spatial_dims_indices)?;
                     return Ok(SampledData::$Variant(sampled));
                 }
             )*
@@ -619,19 +639,19 @@ mod tests {
             .expect("should load asset path");
         let client = GeoZarrClient::new();
         let query_coords = QueryCoordsBuilder::new()
-            .temporal_dim_str("time", "2014-12-31T12:00:00Z")
+            .insert_point_dt_str("time", "2014-12-31T12:00:00Z")
             .expect("should parse")
             .build();
         let path = get_path("tests/fixtures/pyramid.zarr");
         let url = Url::from_file_path(path)
             .map_err(|_| ZarrError::ParameterError("Missing zarr store".into()))?;
         let dim_index = client
-            .load_dim_indices(zarr_store, &url, &asset_path, &query_coords)
+            .load_dim_indices(zarr_store, &url, &asset_path, query_coords)
             .await
             .expect("should load dim coords");
 
         let coord = dim_index.get("time").expect("should have item");
-        assert_eq!(*coord, 2918);
+        assert_eq!(*coord, 2918..2918 + 1);
         Ok(())
     }
 
@@ -644,14 +664,13 @@ mod tests {
         let path = get_path("tests/fixtures/pyramid.zarr");
         let url = Url::from_file_path(path).expect("should have url");
         let query_coords = QueryCoordsBuilder::new()
-            .temporal_dim_str("time", "2014-12-31T12:00:00Z")
+            .insert_point_dt_str("time", "2014-12-31T12:00:00Z")
             .expect("should parse")
             .build();
         let data = client
-            .fetch_data(&url, &cells, "air", &query_coords, StoreType::Zarr, None)
+            .fetch_data(&url, &cells, "air", query_coords, StoreType::Zarr, None)
             .await
             .expect("should fetch");
-
         match data {
             SampledData::F64(data) => assert_eq!(data.len(), cells.len()),
             _ => panic!("wrong data type"),
@@ -666,7 +685,7 @@ mod tests {
         let path = get_path("tests/fixtures/snowgrid.zarr");
         let url = Url::from_file_path(path).expect("should have url");
         let query_coords = QueryCoordsBuilder::new()
-            .temporal_dim_str("time", "2014-12-31T12:00:00Z")
+            .insert_point_dt_str("time", "2014-12-31T12:00:00Z")
             .expect("should parse")
             .build();
         let data = client
@@ -674,7 +693,7 @@ mod tests {
                 &url,
                 &cells,
                 "liquid_water",
-                &query_coords,
+                query_coords,
                 StoreType::Zarr,
                 None,
             )
@@ -696,7 +715,7 @@ mod tests {
         let virtual_chunks_url =
             Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
         let query_coords = QueryCoordsBuilder::new()
-            .temporal_dim_str("time", "2025-10-01T00:00:00Z")
+            .insert_point_dt_str("time", "2025-10-01T00:00:00Z")
             .expect("should parse")
             .build();
         let data = client
@@ -704,7 +723,43 @@ mod tests {
                 &url,
                 &cells,
                 "RR",
-                &query_coords,
+                query_coords,
+                StoreType::Icechunk,
+                Some(&virtual_chunks_url),
+            )
+            .await
+            .expect("should fetch");
+        match data {
+            SampledData::I32(data) => {
+                assert_eq!(data.len(), cells.len())
+            }
+            _ => panic!("wrong data type"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_4() {
+        let client = GeoZarrClient::new();
+        let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
+            .expect("should load cell ids");
+        let path = get_path("tests/fixtures/spartacus.icechunk.zarr");
+        let url = Url::from_file_path(path).expect("should be valid");
+        let virtual_chunks_url =
+            Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
+        let query_coords = QueryCoordsBuilder::new()
+            .insert_range_dt_str(
+                "time",
+                Some("2025-10-01T00:00:00Z"),
+                Some("2025-12-01T00:00:00Z"),
+            )
+            .expect("should parse")
+            .build();
+        let data = client
+            .fetch_data(
+                &url,
+                &cells,
+                "RR",
+                query_coords,
                 StoreType::Icechunk,
                 Some(&virtual_chunks_url),
             )

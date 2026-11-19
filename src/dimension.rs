@@ -72,6 +72,7 @@ impl ChunkIndex {
     }
 
     /// TODO: fast path for uniform chunk size, otherwise use non-uniform chunk sizes
+    /// Currently clamps the values to the array range
     async fn find_absolute_offset<T: ElementOwned + PartialOrd>(
         coords: &Array<ZarrStore>,
         val: T,
@@ -122,9 +123,7 @@ impl ChunkIndex {
             }
         }
 
-        Err(ZarrError::ArrayError(zarrs::array::ArrayError::Other(
-            "Value not found in coordinate array".into(),
-        )))
+        Ok(total_len - 1)
     }
 }
 
