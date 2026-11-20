@@ -1,6 +1,6 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use moka::sync::Cache;
-use zarrs::array::{Array, ElementOwned};
+use zarrs::array::{Array, ArrayError, ElementOwned};
 
 use crate::{error::ZarrError, store::ZarrStore};
 
@@ -56,7 +56,9 @@ impl ChunkIndex {
         }
     }
 
-    pub async fn get_chunk_index<T: CacheKey + ElementOwned + PartialOrd + Clone>(
+    pub async fn get_chunk_index<
+        T: CacheKey + ElementOwned + PartialOrd + Clone + std::fmt::Debug,
+    >(
         &mut self,
         coords: &Array<ZarrStore>,
         val: T,
@@ -73,7 +75,7 @@ impl ChunkIndex {
 
     /// TODO: fast path for uniform chunk size, otherwise use non-uniform chunk sizes
     /// Currently clamps the values to the array range
-    async fn find_absolute_offset<T: ElementOwned + PartialOrd>(
+    async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug>(
         coords: &Array<ZarrStore>,
         val: T,
     ) -> Result<u64, ZarrError> {
@@ -97,17 +99,20 @@ impl ChunkIndex {
                 .map_err(ZarrError::ArrayError)?;
 
             if chunk.is_empty() {
-                return Err(ZarrError::ArrayError(zarrs::array::ArrayError::Other(
+                return Err(ZarrError::ArrayError(ArrayError::Other(
                     "Retrieved empty chunk".into(),
                 )));
             }
 
             let chunk_start_val = &chunk[0];
-            let chunk_end_val = &chunk[chunk.len() - 1];
+            let max_idx = (chunk_size.min(total_len) - 1).max(1) as usize;
+            let chunk_end_val = &chunk[max_idx];
 
             if val < *chunk_start_val {
                 if mid_chunk == 0 {
-                    return Ok(0);
+                    return Err(ZarrError::ArrayError(ArrayError::Other(format!(
+                        "Coordinate value below range: {val:?}"
+                    ))));
                 }
                 high_chunk = mid_chunk - 1;
             } else if val > *chunk_end_val {
@@ -123,7 +128,9 @@ impl ChunkIndex {
             }
         }
 
-        Ok(total_len - 1)
+        Err(ZarrError::ArrayError(ArrayError::Other(format!(
+            "Coordinate value out of range: {val:?}"
+        ))))
     }
 }
 

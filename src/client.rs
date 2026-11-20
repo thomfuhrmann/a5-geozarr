@@ -685,7 +685,7 @@ mod tests {
         let path = get_path("tests/fixtures/snowgrid.zarr");
         let url = Url::from_file_path(path).expect("should have url");
         let query_coords = QueryCoordsBuilder::new()
-            .insert_point_dt_str("time", "2014-12-31T12:00:00Z")
+            .insert_point_dt_str("time", "2026-08-13T00:00:00Z")
             .expect("should parse")
             .build();
         let data = client
@@ -715,7 +715,7 @@ mod tests {
         let virtual_chunks_url =
             Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
         let query_coords = QueryCoordsBuilder::new()
-            .insert_point_dt_str("time", "2025-10-01T00:00:00Z")
+            .insert_point_dt_str("time", "2025-10-21T00:00:00Z")
             .expect("should parse")
             .build();
         let data = client
