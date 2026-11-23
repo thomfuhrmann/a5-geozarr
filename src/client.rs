@@ -15,8 +15,8 @@ use zarrs::{
     array::{
         Array, ElementOwned,
         data_type::{
-            Float32DataType, Float64DataType, Int32DataType, Int64DataType, UInt32DataType,
-            UInt64DataType,
+            Float32DataType, Float64DataType, Int16DataType, Int32DataType, Int64DataType,
+            UInt8DataType, UInt16DataType, UInt32DataType, UInt64DataType,
         },
     },
     node::{Node, NodePath},
@@ -457,8 +457,11 @@ impl GeoZarrClient {
                 self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices, spatial_indices,
                 Float32DataType => (f32, F32),
                 Float64DataType => (f64, F64),
+                UInt8DataType => (u8, U8),
+                UInt16DataType => (u16, U16),
                 UInt32DataType => (u32, U32),
                 UInt64DataType => (u64, U64),
+                Int16DataType => (i16, I16),
                 Int32DataType => (i32, I32),
                 Int64DataType => (i64, I64),
             )
@@ -582,8 +585,11 @@ pub enum SampledData {
     None,
     F32(Vec<Option<ArrayD<f32>>>),
     F64(Vec<Option<ArrayD<f64>>>),
+    U8(Vec<Option<ArrayD<u8>>>),
+    U16(Vec<Option<ArrayD<u16>>>),
     U32(Vec<Option<ArrayD<u32>>>),
     U64(Vec<Option<ArrayD<u64>>>),
+    I16(Vec<Option<ArrayD<i16>>>),
     I32(Vec<Option<ArrayD<i32>>>),
     I64(Vec<Option<ArrayD<i64>>>),
 }
