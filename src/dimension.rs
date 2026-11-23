@@ -67,36 +67,81 @@ impl ChunkIndex {
         if let Some(loc) = self.cache.get(&key) {
             Ok(loc)
         } else {
-            let loc = Self::find_absolute_offset(coords, val).await?;
+            let loc = find_absolute_offset(coords, val).await?;
             self.cache.insert(key, loc);
             Ok(loc)
         }
     }
+}
 
-    /// TODO: fast path for uniform chunk size, otherwise use non-uniform chunk sizes
-    /// Currently clamps the values to the array range
-    async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug>(
-        coords: &Array<ZarrStore>,
-        val: T,
-    ) -> Result<u64, ZarrError> {
-        let shape = coords.shape();
-        let total_len = shape[0];
+/// Checks if all chunks have uniform size
+fn is_uniform_chunk_grid(coords: &Array<ZarrStore>) -> Result<bool, ZarrError> {
+    let chunk_grid_shape = coords.chunk_grid_shape();
+    if chunk_grid_shape.len() != 1 {
+        return Err(ZarrError::CoordinateError(format!(
+            "Expected a chunk grid shape of length 1, got: {}",
+            chunk_grid_shape.len()
+        )));
+    }
 
-        let bytes = ArrayBytes::new_fill_value(coords.data_type(), 1, coords.fill_value())
-            .map_err(|e| ZarrError::CodecError(e.into()))?;
-        let mut elements =
-            T::from_array_bytes(coords.data_type(), bytes).map_err(ZarrError::ElementError)?;
-        let null_val = elements
-            .pop()
-            .ok_or_else(|| ZarrError::CoordinateError("Expected one fill value element".into()))?;
+    let num_chunks = chunk_grid_shape[0];
+    let mut chunk_size = None;
+    for i in 0..num_chunks {
+        let chunk_shape = coords.chunk_shape(&[i]).map_err(ZarrError::ArrayError)?;
+        if chunk_shape.len() != 1 {
+            return Err(ZarrError::CoordinateError(format!(
+                "Expected a chunk shape of length 1, got: {}",
+                chunk_grid_shape.len()
+            )));
+        }
 
+        let local_chunk_size = u64::from(chunk_shape[0]);
+        if let Some(val) = chunk_size {
+            if val != local_chunk_size {
+                return Ok(false);
+            }
+        } else {
+            chunk_size = Some(local_chunk_size);
+        }
+    }
+    Ok(true)
+}
+
+/// Finds the absolute offset for both ascending and descending coordinate arrays
+async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + Clone>(
+    coords: &Array<ZarrStore>,
+    val: T,
+) -> Result<u64, ZarrError> {
+    let shape = coords.shape();
+    let total_len = shape[0];
+    if total_len == 0 {
+        return Err(ZarrError::CoordinateError(
+            "Coordinate array is empty".into(),
+        ));
+    }
+
+    let bytes = ArrayBytes::new_fill_value(coords.data_type(), 1, coords.fill_value())
+        .map_err(|e| ZarrError::CodecError(e.into()))?;
+    let mut elements =
+        T::from_array_bytes(coords.data_type(), bytes).map_err(ZarrError::ElementError)?;
+    let null_val = elements
+        .pop()
+        .ok_or_else(|| ZarrError::CoordinateError("Expected one fill value element".into()))?;
+
+    let order = detect_sort_order(coords, &null_val).await?;
+
+    if is_uniform_chunk_grid(coords)? {
         let chunk_shape = coords.chunk_shape(&[0]).map_err(ZarrError::ArrayError)?;
         let chunk_size = u64::from(chunk_shape[0]);
+        if chunk_size == 0 {
+            return Err(ZarrError::CoordinateError(
+                "Chunk size must be greater than zero".into(),
+            ));
+        }
 
         let total_chunks = total_len.div_ceil(chunk_size);
-
-        let mut low_chunk = 0;
-        let mut high_chunk = total_chunks - 1;
+        let mut low_chunk: u64 = 0;
+        let mut high_chunk: u64 = total_chunks - 1;
 
         while low_chunk <= high_chunk {
             let mid_chunk = low_chunk + (high_chunk - low_chunk) / 2;
@@ -123,19 +168,19 @@ impl ChunkIndex {
                     ZarrError::CoordinateError("Array only contains null values".into())
                 })?;
 
-            if val < *chunk_start_val {
+            if order.is_before_start(&val, chunk_start_val) {
                 if mid_chunk == 0 {
-                    return Err(ZarrError::ArrayError(ArrayError::Other(format!(
-                        "Coordinate value below range: {val:?}"
-                    ))));
+                    return Err(ZarrError::CoordinateError(format!(
+                        "Coordinate value out of range (before start): {val:?}"
+                    )));
                 }
                 high_chunk = mid_chunk - 1;
-            } else if val > *chunk_end_val {
+            } else if order.is_past_end(&val, chunk_end_val) {
                 low_chunk = mid_chunk + 1;
             } else {
                 let local_offset = chunk
                     .iter()
-                    .position(|x| x >= &val)
+                    .position(|x| x != &null_val && order.matches_target(x, &val))
                     .unwrap_or(chunk.len() - 1) as u64;
 
                 let absolute_offset = (mid_chunk * chunk_size) + local_offset;
@@ -143,9 +188,138 @@ impl ChunkIndex {
             }
         }
 
-        Err(ZarrError::ArrayError(ArrayError::Other(format!(
-            "Coordinate value above range: {val:?}"
-        ))))
+        Err(ZarrError::CoordinateError(format!(
+            "Coordinate value out of range (past end): {val:?}"
+        )))
+    } else {
+        let num_chunks = coords.chunk_grid_shape()[0];
+        let mut abs_offset: u64 = 0;
+        let mut saw_any_non_null = false;
+
+        for i in 0..num_chunks {
+            let chunk = coords
+                .async_retrieve_chunk::<Vec<T>>(&[i])
+                .await
+                .map_err(ZarrError::ArrayError)?;
+
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let chunk_len = chunk.len() as u64;
+            let first_non_null = chunk.iter().find(|&v| v != &null_val);
+            let last_non_null = chunk.iter().rev().find(|&v| v != &null_val);
+
+            let (Some(chunk_start_val), Some(chunk_end_val)) = (first_non_null, last_non_null)
+            else {
+                abs_offset += chunk_len;
+                continue;
+            };
+
+            saw_any_non_null = true;
+
+            if i == 0 && order.is_before_start(&val, chunk_start_val) {
+                return Err(ZarrError::CoordinateError(format!(
+                    "Coordinate value out of range (before start): {val:?}"
+                )));
+            }
+
+            if !order.is_past_end(&val, chunk_end_val) {
+                let local_offset = chunk
+                    .iter()
+                    .position(|x| x != &null_val && order.matches_target(x, &val))
+                    .unwrap_or((chunk_len - 1) as usize) as u64;
+
+                return Ok((abs_offset + local_offset).min(total_len - 1));
+            }
+
+            abs_offset += chunk_len;
+        }
+
+        if !saw_any_non_null {
+            return Err(ZarrError::CoordinateError(
+                "Array only contains null values".into(),
+            ));
+        }
+
+        Err(ZarrError::CoordinateError(format!(
+            "Coordinate value out of range (past end): {val:?}"
+        )))
+    }
+}
+
+/// Possible sort orders of coordinate arrays
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SortOrder {
+    Ascending,
+    Descending,
+}
+
+impl SortOrder {
+    #[inline]
+    fn is_before_start<T: PartialOrd>(self, val: &T, start: &T) -> bool {
+        match self {
+            Self::Ascending => val < start,
+            Self::Descending => val > start,
+        }
+    }
+
+    #[inline]
+    fn is_past_end<T: PartialOrd>(self, val: &T, end: &T) -> bool {
+        match self {
+            Self::Ascending => val > end,
+            Self::Descending => val < end,
+        }
+    }
+
+    #[inline]
+    fn matches_target<T: PartialOrd>(self, x: &T, val: &T) -> bool {
+        match self {
+            Self::Ascending => x >= val,
+            Self::Descending => x <= val,
+        }
+    }
+}
+
+/// Detects the sort order of the coordinate array
+async fn detect_sort_order<T: ElementOwned + PartialOrd>(
+    coords: &Array<ZarrStore>,
+    null_val: &T,
+) -> Result<SortOrder, ZarrError> {
+    let num_chunks = coords.chunk_grid_shape()[0];
+
+    let mut first_val: Option<T> = None;
+    for i in 0..num_chunks {
+        let chunk = coords
+            .async_retrieve_chunk::<Vec<T>>(&[i])
+            .await
+            .map_err(ZarrError::ArrayError)?;
+        if let Some(v) = chunk.iter().find(|&v| v != null_val) {
+            first_val = Some(v.clone());
+            break;
+        }
+    }
+    let first = first_val
+        .ok_or_else(|| ZarrError::CoordinateError("Array only contains null values".into()))?;
+
+    let mut last_val: Option<T> = None;
+    for i in (0..num_chunks).rev() {
+        let chunk = coords
+            .async_retrieve_chunk::<Vec<T>>(&[i])
+            .await
+            .map_err(ZarrError::ArrayError)?;
+        if let Some(v) = chunk.iter().rev().find(|&v| v != null_val) {
+            last_val = Some(v.clone());
+            break;
+        }
+    }
+    let last = last_val
+        .ok_or_else(|| ZarrError::CoordinateError("Array only contains null values".into()))?;
+
+    if first > last {
+        Ok(SortOrder::Descending)
+    } else {
+        Ok(SortOrder::Ascending)
     }
 }
 
