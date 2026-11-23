@@ -1,6 +1,6 @@
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use moka::sync::Cache;
-use zarrs::array::{Array, ArrayError, ElementOwned};
+use zarrs::array::{Array, ArrayBytes, ArrayError, ElementOwned};
 
 use crate::{error::ZarrError, store::ZarrStore};
 
@@ -82,6 +82,14 @@ impl ChunkIndex {
         let shape = coords.shape();
         let total_len = shape[0];
 
+        let bytes = ArrayBytes::new_fill_value(coords.data_type(), 1, coords.fill_value())
+            .map_err(|e| ZarrError::CodecError(e.into()))?;
+        let mut elements =
+            T::from_array_bytes(coords.data_type(), bytes).map_err(ZarrError::ElementError)?;
+        let null_val = elements
+            .pop()
+            .ok_or_else(|| ZarrError::CoordinateError("Expected one fill value element".into()))?;
+
         let chunk_shape = coords.chunk_shape(&[0]).map_err(ZarrError::ArrayError)?;
         let chunk_size = u64::from(chunk_shape[0]);
 
@@ -104,9 +112,16 @@ impl ChunkIndex {
                 )));
             }
 
-            let chunk_start_val = &chunk[0];
-            let max_idx = (chunk_size.min(total_len) - 1).max(1) as usize;
-            let chunk_end_val = &chunk[max_idx];
+            let chunk_start_val = chunk.iter().find(|&v| v != &null_val).ok_or_else(|| {
+                ZarrError::CoordinateError("Array only contains null-values".into())
+            })?;
+            let chunk_end_val = chunk
+                .iter()
+                .rev()
+                .find(|&v| v != &null_val)
+                .ok_or_else(|| {
+                    ZarrError::CoordinateError("Array only contains null values".into())
+                })?;
 
             if val < *chunk_start_val {
                 if mid_chunk == 0 {
@@ -129,7 +144,7 @@ impl ChunkIndex {
         }
 
         Err(ZarrError::ArrayError(ArrayError::Other(format!(
-            "Coordinate value out of range: {val:?}"
+            "Coordinate value above range: {val:?}"
         ))))
     }
 }

@@ -3,6 +3,7 @@
 use std::{array::TryFromSliceError, num::ParseFloatError, path::PathBuf};
 
 use image::ImageError;
+use zarrs::array::{ElementError, data_type::api::DataTypeFillValueError};
 use zarrs_icechunk::icechunk::{StorageError, repository::RepositoryError};
 
 /// Errors that can occur when working with Zarr stores
@@ -105,4 +106,10 @@ pub enum ZarrError {
     /// Shape error
     #[error("Shape error: {0}")]
     ShapeError(ndarray::ShapeError),
+    /// Fill value conversion error
+    #[error("Codec error: {0}")]
+    CodecError(#[from] DataTypeFillValueError),
+    /// Element error
+    #[error("Element error: {0}")]
+    ElementError(#[source] ElementError),
 }
