@@ -14,6 +14,7 @@ use zarrs::array::{
 use crate::error::ZarrError;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum CoordValue {
     Temporal(DateTime<Utc>),
     F32(f32),
@@ -289,7 +290,9 @@ impl QueryCoordsBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::query::QuerySelection;
+    use std::collections::HashMap;
+
+    use crate::query::{QueryCoordsBuilder, QuerySelection};
 
     #[test]
     fn test_deserialize() -> Result<(), serde_json::Error> {
@@ -313,6 +316,21 @@ mod tests {
             }
         }"#;
         let _val = serde_json::from_str::<QuerySelection>(raw)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_roundtrip() -> Result<(), serde_json::Error> {
+        let query_coords = QueryCoordsBuilder::new()
+            .insert_point_dt_str("time", "2025-11-17T00:00:00Z")
+            .expect("should parse")
+            .build();
+
+        let json_sel = serde_json::to_string(&query_coords).unwrap();
+
+        let query_coords_parsed: HashMap<String, QuerySelection> = serde_json::from_str(&json_sel)?;
+        assert_eq!(query_coords, query_coords_parsed);
 
         Ok(())
     }
