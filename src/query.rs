@@ -119,6 +119,21 @@ impl CoordValue {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum CoordValues {
+    None,
+    Datetime(Vec<DateTime<Utc>>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    I16(Vec<i16>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    U8(Vec<u8>),
+    U16(Vec<u16>),
+    U32(Vec<u32>),
+    U64(Vec<u64>),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum QuerySelection {
     /// A single exact coordinate point

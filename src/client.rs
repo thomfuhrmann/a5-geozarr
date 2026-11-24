@@ -37,12 +37,13 @@ use crate::{
         GeozarrMetadata, calculate_resolution_levels, get_proj, get_spatial_dims,
         get_spatial_dims_indices, native_cell_res, select_best_level, zarr_nodes,
     },
-    query::{CoordValue, QuerySelection},
+    query::{CoordValue, CoordValues, QuerySelection},
     store::ZarrStore,
     warp_grid::{TARGET_CRS, WarpGrid},
 };
 
-use crate::dispatch_arms;
+use crate::fetch_coords;
+use crate::sample;
 
 #[derive(Debug, Clone)]
 pub enum StoreType {
@@ -216,7 +217,7 @@ impl GeoZarrClient {
         url: &Url,
         asset_path: &NodePath,
         query_coords: HashMap<String, QuerySelection>,
-    ) -> Result<HashMap<String, Range<u64>>, ZarrError> {
+    ) -> Result<HashMap<String, (Range<u64>, CoordValues)>, ZarrError> {
         let mut dims_index = HashMap::new();
 
         // process dimensions
@@ -225,57 +226,129 @@ impl GeoZarrClient {
                 .join(&dim_name)
                 .map_err(ZarrError::NodePathError)?;
             let key = ChunkIndexKey::new(url.clone(), dim_path.clone());
-            let range = match Array::async_open(Arc::clone(&zarr_store), dim_path.as_str()).await {
-                Ok(array) => {
-                    let meta = DimMeta::get_metadata(&dim_name, &array)?;
-                    match sel {
-                        QuerySelection::Point(coord) => {
-                            let offset = self.abs_offset(&array, key, coord, meta).await?;
-                            offset..(offset + 1)
-                        }
-                        QuerySelection::Range { start, end } => match (start, end) {
-                            (Some(start), Some(end)) => {
-                                let start = self
-                                    .abs_offset(&array, key.clone(), start, meta.clone())
-                                    .await?;
-                                let end = self.abs_offset(&array, key, end, meta).await?;
-                                start..end
-                            }
-                            (Some(start), None) => {
-                                let start = self.abs_offset(&array, key, start, meta).await?;
-                                let end = array.shape()[0];
-                                start..end
-                            }
-                            (None, Some(end)) => {
-                                let start = 0;
-                                let end = self.abs_offset(&array, key, end, meta).await?;
-                                start..end
-                            }
-                            (None, None) => {
-                                let start = 0;
-                                let end = array.shape()[0];
-                                start..end
-                            }
-                        },
-                    }
-                }
-                // if dimension is present in data variable but no physical array is present
-                Err(_) => 0..1,
-            };
+            let (range, subset) =
+                match Array::async_open(Arc::clone(&zarr_store), dim_path.as_str()).await {
+                    Ok(array) => {
+                        let meta = DimMeta::get_metadata(&dim_name, &array)?;
+                        let total_len = array.shape()[0];
 
-            dims_index.insert(dim_name.clone(), range);
+                        let range = match sel {
+                            QuerySelection::Point(coord) => {
+                                let offset = self.get_offset(&array, key, coord, &meta).await?;
+                                if let Some(offset) = offset {
+                                    Some(offset..(offset + 1))
+                                } else {
+                                    None
+                                }
+                            }
+                            QuerySelection::Range { start, end } => match (start, end) {
+                                (Some(start), Some(end)) => {
+                                    let start =
+                                        self.get_offset(&array, key.clone(), start, &meta).await?;
+                                    let end = self.get_offset(&array, key, end, &meta).await?;
+                                    match (start, end) {
+                                        (Some(start), Some(end)) => Some(start..end + 1),
+                                        (Some(start), None) => Some(start..total_len),
+                                        (None, Some(end)) => Some(0..end + 1),
+                                        (None, None) => Some(0..total_len),
+                                    }
+                                }
+                                (Some(start), None) => {
+                                    let start = self.get_offset(&array, key, start, &meta).await?;
+                                    if let Some(start) = start {
+                                        Some(start..total_len)
+                                    } else {
+                                        Some(0..total_len)
+                                    }
+                                }
+                                (None, Some(end)) => {
+                                    let end = self.get_offset(&array, key, end, &meta).await?;
+                                    if let Some(end) = end {
+                                        Some(0..end + 1)
+                                    } else {
+                                        Some(0..total_len)
+                                    }
+                                }
+                                (None, None) => Some(0..total_len),
+                            },
+                        };
+
+                        if let Some(range) = range {
+                            let coords =
+                                Self::get_coord_values(&array, range.clone(), &meta).await?;
+                            (range, coords)
+                        } else {
+                            (0..0, CoordValues::None)
+                        }
+                    }
+                    // if dimension is present in data variable but no physical array is present
+                    Err(_) => (0..1, CoordValues::None),
+                };
+
+            dims_index.insert(dim_name.clone(), (range, subset));
         }
 
         Ok(dims_index)
     }
 
-    pub async fn abs_offset(
+    pub async fn get_coord_values(
+        array: &Array<ZarrStore>,
+        range: Range<u64>,
+        meta: &DimMeta,
+    ) -> Result<CoordValues, ZarrError> {
+        let coords = fetch_coords!(
+             array, range,
+            Float32DataType => (f32, F32),
+            Float64DataType => (f64, F64),
+            UInt8DataType => (u8, U8),
+            UInt16DataType => (u16, U16),
+            UInt32DataType => (u32, U32),
+            UInt64DataType => (u64, U64),
+            Int16DataType => (i16, I16),
+            Int32DataType => (i32, I32),
+            Int64DataType => (i64, I64),
+        )?;
+
+        if let DimMeta::Time(meta) = meta {
+            match coords {
+                CoordValues::F32(vals) => Ok(CoordValues::Datetime(
+                    vals.into_iter()
+                        .filter_map(|val| meta.raw_to_datetime(val as f64))
+                        .collect::<Vec<_>>(),
+                )),
+                CoordValues::F64(vals) => Ok(CoordValues::Datetime(
+                    vals.into_iter()
+                        .filter_map(|val| meta.raw_to_datetime(val))
+                        .collect::<Vec<_>>(),
+                )),
+                CoordValues::U32(vals) => Ok(CoordValues::Datetime(
+                    vals.into_iter()
+                        .filter_map(|val| meta.raw_to_datetime(val as f64))
+                        .collect::<Vec<_>>(),
+                )),
+                CoordValues::U64(vals) => Ok(CoordValues::Datetime(
+                    vals.into_iter()
+                        .filter_map(|val| meta.raw_to_datetime(val as f64))
+                        .collect::<Vec<_>>(),
+                )),
+                _ => {
+                    return Err(ZarrError::CoordinateError(
+                        "Unsupported data type for temporal dimension".to_string(),
+                    ));
+                }
+            }
+        } else {
+            Ok(coords)
+        }
+    }
+
+    pub async fn get_offset(
         &self,
         array: &Array<ZarrStore>,
         key: ChunkIndexKey,
         val: CoordValue,
-        meta: DimMeta,
-    ) -> Result<u64, ZarrError> {
+        meta: &DimMeta,
+    ) -> Result<Option<u64>, ZarrError> {
         let mut index = self.chunk_indices.entry(key).or_default();
         let data_type = array.data_type();
         let coerced = val.coerce_to(data_type)?;
@@ -323,7 +396,7 @@ impl GeoZarrClient {
         query_coords: HashMap<String, QuerySelection>,
         store_type: StoreType,
         virtual_chunks_url: Option<&Url>,
-    ) -> Result<SampledData, ZarrError> {
+    ) -> Result<(SampledData, Option<HashMap<String, CoordValues>>), ZarrError> {
         if cell_ids.is_empty() {
             return Err(ZarrError::ParameterError(
                 "Must provide at least one cell id".into(),
@@ -453,7 +526,7 @@ impl GeoZarrClient {
         let spatial_indices = get_spatial_dims_indices(spatial_dims, dimension_names)?;
 
         if let Some(bbox) = bbox {
-            dispatch_arms!(
+            sample!(
                 self, array, cell_ids, warp_grid, bbox, dimension_names, spatial_dims, dim_indices, spatial_indices,
                 Float32DataType => (f32, F32),
                 Float64DataType => (f64, F64),
@@ -466,7 +539,7 @@ impl GeoZarrClient {
                 Int64DataType => (i64, I64),
             )
         } else {
-            Ok(SampledData::None)
+            Ok((SampledData::None, None))
         }
     }
 
@@ -476,7 +549,7 @@ impl GeoZarrClient {
         bbox: [u64; 4],
         dimension_names: &[Option<String>],
         spatial_dims: &[String],
-        dim_indices: &HashMap<String, Range<u64>>,
+        dim_indices: &HashMap<String, (Range<u64>, CoordValues)>,
     ) -> Result<ArrayD<T>, ZarrError> {
         let x_end = bbox[2]
             .checked_add(1)
@@ -491,7 +564,7 @@ impl GeoZarrClient {
             .iter()
             .flatten()
             .filter_map(|name| {
-                if let Some(idx) = dim_indices.get(name) {
+                if let Some((idx, _)) = dim_indices.get(name) {
                     return Some(idx.clone());
                 }
 
@@ -595,7 +668,7 @@ pub enum SampledData {
 }
 
 #[macro_export]
-macro_rules! dispatch_arms {
+macro_rules! sample {
     (
         $self:expr, $array:expr, $cell_ids:expr, $warp_grid:expr,
         $bbox:expr, $dimension_names:expr, $spatial_dims:expr, $dim_indices:expr, $spatial_dims_indices:expr,
@@ -610,13 +683,42 @@ macro_rules! dispatch_arms {
                         .await?;
                     let sampled = $self
                         .sample_at_warp_grid::<$numeric_type>($cell_ids, &$warp_grid, $bbox, &data, &$spatial_dims_indices)?;
-                    return Ok(SampledData::$Variant(sampled));
+                    let coord_vals = $dim_indices.into_iter().map(|(key, val)|(key, val.1)).collect::<HashMap<_,_>>();
+                    return Ok((SampledData::$Variant(sampled), Some(coord_vals)));
                 }
             )*
 
             Err($crate::error::ZarrError::DataTypeError(
                 format!("Unsupported data type: {:?}", data_type)
             ))
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! fetch_coords {
+    (
+        $array:expr, $range:expr,
+        $( $T:ty => ($numeric_type:ty, $Variant:ident) ),* $(,)?
+    ) => {
+        {
+            let data_type = $array.data_type();
+            $(
+                if data_type.is::<$T>() {
+                    match $array
+                        .async_retrieve_array_subset::<Vec<$numeric_type>>(&[$range])
+                        .await
+                    {
+                        Ok(subset) => Ok($crate::query::CoordValues::$Variant(subset)),
+                        Err(e) => Err($crate::error::ZarrError::ArrayError(e)),
+                    }
+                } else
+            )*
+            {
+                Err($crate::error::ZarrError::DataTypeError(
+                    format!("Unsupported data type: {:?}", data_type)
+                ))
+            }
         }
     };
 }
@@ -656,7 +758,7 @@ mod tests {
             .await
             .expect("should load dim coords");
 
-        let coord = dim_index.get("time").expect("should have item");
+        let (coord, _) = dim_index.get("time").expect("should have item");
         assert_eq!(*coord, 2918..2918 + 1);
         Ok(())
     }
@@ -678,7 +780,7 @@ mod tests {
             .await
             .expect("should fetch");
         match data {
-            SampledData::F64(data) => assert_eq!(data.len(), cells.len()),
+            (SampledData::F64(data), _) => assert_eq!(data.len(), cells.len()),
             _ => panic!("wrong data type"),
         }
     }
@@ -705,8 +807,9 @@ mod tests {
             )
             .await
             .expect("should fetch");
+
         match data {
-            SampledData::F32(data) => assert_eq!(data.len(), cells.len()),
+            (SampledData::F32(data), _) => assert_eq!(data.len(), cells.len()),
             _ => panic!("wrong data type"),
         }
     }
@@ -736,7 +839,7 @@ mod tests {
             .await
             .expect("should fetch");
         match data {
-            SampledData::I32(data) => {
+            (SampledData::I32(data), _) => {
                 assert_eq!(data.len(), cells.len())
             }
             _ => panic!("wrong data type"),
@@ -772,7 +875,7 @@ mod tests {
             .await
             .expect("should fetch");
         match data {
-            SampledData::I32(data) => {
+            (SampledData::I32(data), _) => {
                 assert_eq!(data.len(), cells.len())
             }
             _ => panic!("wrong data type"),

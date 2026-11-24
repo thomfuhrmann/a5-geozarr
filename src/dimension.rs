@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, TimeZone, Utc};
 use moka::sync::Cache;
 use zarrs::array::{Array, ArrayBytes, ArrayError, ElementOwned};
 
@@ -38,7 +38,7 @@ impl_integer_cache_key!(i32, i64, u32, u64);
 /// A cache for mappings from coordinate values to offsets
 #[derive(Debug, Clone)]
 pub struct ChunkIndex {
-    cache: Cache<u64, u64>,
+    cache: Cache<u64, Option<u64>>,
 }
 
 impl Default for ChunkIndex {
@@ -62,7 +62,7 @@ impl ChunkIndex {
         &mut self,
         coords: &Array<ZarrStore>,
         val: T,
-    ) -> Result<u64, ZarrError> {
+    ) -> Result<Option<u64>, ZarrError> {
         let key = val.clone().to_cache_key();
         if let Some(loc) = self.cache.get(&key) {
             Ok(loc)
@@ -108,16 +108,16 @@ fn is_uniform_chunk_grid(coords: &Array<ZarrStore>) -> Result<bool, ZarrError> {
 }
 
 /// Finds the absolute offset for both ascending and descending coordinate arrays
+/// Default for point queries: last at or before
+/// Default for slice queries: overlap
 async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + Clone>(
     coords: &Array<ZarrStore>,
     val: T,
-) -> Result<u64, ZarrError> {
+) -> Result<Option<u64>, ZarrError> {
     let shape = coords.shape();
     let total_len = shape[0];
     if total_len == 0 {
-        return Err(ZarrError::CoordinateError(
-            "Coordinate array is empty".into(),
-        ));
+        return Ok(None);
     }
 
     let bytes = ArrayBytes::new_fill_value(coords.data_type(), 1, coords.fill_value())
@@ -170,9 +170,7 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
 
             if order.is_before_start(&val, chunk_start_val) {
                 if mid_chunk == 0 {
-                    return Err(ZarrError::CoordinateError(format!(
-                        "Coordinate value out of range (before start): {val:?}"
-                    )));
+                    return Ok(None);
                 }
                 high_chunk = mid_chunk - 1;
             } else if order.is_past_end(&val, chunk_end_val) {
@@ -180,17 +178,20 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
             } else {
                 let local_offset = chunk
                     .iter()
-                    .position(|x| x != &null_val && order.matches_target(x, &val))
-                    .unwrap_or(chunk.len() - 1) as u64;
+                    .enumerate()
+                    .rev()
+                    .find(|(_, x)| *x != &null_val && val >= **x)
+                    .map(|(idx, _)| idx as u64)
+                    .ok_or_else(|| {
+                        ZarrError::CoordinateError("Can not find matching value".to_string())
+                    })?;
 
                 let absolute_offset = (mid_chunk * chunk_size) + local_offset;
-                return Ok(absolute_offset.min(total_len - 1));
+                return Ok(Some(absolute_offset.min(total_len - 1)));
             }
         }
 
-        Err(ZarrError::CoordinateError(format!(
-            "Coordinate value out of range (past end): {val:?}"
-        )))
+        Ok(None)
     } else {
         let num_chunks = coords.chunk_grid_shape()[0];
         let mut abs_offset: u64 = 0;
@@ -218,19 +219,22 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
 
             saw_any_non_null = true;
 
-            if i == 0 && order.is_before_start(&val, chunk_start_val) {
-                return Err(ZarrError::CoordinateError(format!(
-                    "Coordinate value out of range (before start): {val:?}"
-                )));
+            if order.is_before_start(&val, chunk_start_val) {
+                return Ok(None);
             }
 
             if !order.is_past_end(&val, chunk_end_val) {
                 let local_offset = chunk
                     .iter()
-                    .position(|x| x != &null_val && order.matches_target(x, &val))
-                    .unwrap_or((chunk_len - 1) as usize) as u64;
+                    .enumerate()
+                    .rev()
+                    .find(|(_, x)| *x != &null_val && val >= **x)
+                    .map(|(idx, _)| idx as u64)
+                    .ok_or_else(|| {
+                        ZarrError::CoordinateError("Can not find matching value".to_string())
+                    })?;
 
-                return Ok((abs_offset + local_offset).min(total_len - 1));
+                return Ok(Some((abs_offset + local_offset).min(total_len - 1)));
             }
 
             abs_offset += chunk_len;
@@ -242,9 +246,7 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
             ));
         }
 
-        Err(ZarrError::CoordinateError(format!(
-            "Coordinate value out of range (past end): {val:?}"
-        )))
+        Ok(None)
     }
 }
 
@@ -269,14 +271,6 @@ impl SortOrder {
         match self {
             Self::Ascending => val > end,
             Self::Descending => val < end,
-        }
-    }
-
-    #[inline]
-    fn matches_target<T: PartialOrd>(self, x: &T, val: &T) -> bool {
-        match self {
-            Self::Ascending => x >= val,
-            Self::Descending => x <= val,
         }
     }
 }
@@ -389,10 +383,6 @@ impl TimeMetadata {
     pub fn datetime_to_raw(&self, val: &DateTime<Utc>) -> f64 {
         let duration = val.signed_duration_since(self.epoch);
         let secs = duration.num_seconds();
-        let nanos = i64::from(duration.subsec_nanos());
-
-        let total_seconds = secs + (nanos / 1_000_000_000);
-
         let scale = match self.units.as_str() {
             "days" => 1.0 / 86400.0,
             "hours" => 1.0 / 3600.0,
@@ -401,8 +391,29 @@ impl TimeMetadata {
             "microseconds" => 1_000_000.0,
             _ => 1.0, // "seconds"
         };
+        secs as f64 * scale
+    }
 
-        total_seconds as f64 * scale
+    pub fn raw_to_datetime(&self, val: f64) -> Option<DateTime<Utc>> {
+        if !val.is_finite() {
+            return None;
+        }
+
+        let seconds_per_unit = match self.units.as_str() {
+            "days" => 86_400.0,
+            "hours" => 3_600.0,
+            "minutes" => 60.0,
+            "milliseconds" => 0.001,
+            "microseconds" => 1e-6,
+            _ => 1.0, // "seconds"
+        };
+
+        let total_seconds = val * seconds_per_unit;
+        let whole_seconds = total_seconds.trunc() as i64;
+        let frac_nanos = ((total_seconds.fract()) * 1_000_000_000.0).round() as i64;
+
+        let delta = TimeDelta::try_seconds(whole_seconds)? + TimeDelta::nanoseconds(frac_nanos);
+        self.epoch.checked_add_signed(delta)
     }
 }
 
@@ -445,7 +456,7 @@ mod tests {
             }
             .expect("should have location");
 
-            assert_eq!(loc, 2918);
+            assert_eq!(loc, Some(2918));
         }
     }
 }
