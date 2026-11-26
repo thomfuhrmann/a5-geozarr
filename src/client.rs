@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Debug,
     hash::Hasher,
     ops::{Range, RangeFull},
     sync::Arc,
@@ -7,7 +8,11 @@ use std::{
 };
 
 use dashmap::DashMap;
-use icechunk::{new_local_filesystem_storage, storage::new_http_storage};
+use icechunk::{
+    config::{S3Credentials, S3Options, S3StaticCredentials},
+    new_local_filesystem_storage, new_s3_object_store_storage,
+    storage::new_http_storage,
+};
 use ndarray::{ArrayD, IxDyn, Slice, SliceInfo, SliceInfoElem};
 use object_store::{Error, ObjectStore, http::HttpBuilder, local::LocalFileSystem};
 use url::Url;
@@ -87,6 +92,17 @@ impl ChunkIndexKey {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ObjectStoreConfig {
+    pub region: String,
+    pub endpoint_url: Url,
+    pub bucket: String,
+    pub force_path_style: bool,
+    pub anonymous: bool,
+    pub access_key_id: Option<String>,
+    pub secret_access_key: Option<String>,
+}
+
 #[derive(Default, Clone)]
 pub struct GeoZarrClient {
     /// One warp grid per spatial crs and spatial transform
@@ -95,11 +111,28 @@ pub struct GeoZarrClient {
     pub store_registry: Arc<DashMap<Url, Arc<ZarrStore>>>,
     /// Cache for mappings from coordinate values to chunk indices and offsets
     pub chunk_indices: Arc<DashMap<ChunkIndexKey, ChunkIndex>>,
+    /// Options for object stores
+    pub object_store_registry: Arc<DashMap<Url, Option<ObjectStoreConfig>>>,
+}
+
+impl Debug for GeoZarrClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GeoZarrClient")
+            .field("warp_grids", &self.warp_grids)
+            .field("chunk_indices", &self.chunk_indices)
+            .field("object_store_registry", &self.object_store_registry)
+            .finish()
+    }
 }
 
 impl GeoZarrClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_object_store_config(self, bucket: Url, config: ObjectStoreConfig) -> Self {
+        self.object_store_registry.insert(bucket, Some(config));
+        self
     }
 
     pub fn build_object_store(url: &Url) -> Result<Arc<dyn ObjectStore>, Error> {
@@ -127,7 +160,9 @@ impl GeoZarrClient {
 
     // Icechunk only allows async creation of `ObjectStorage`
     pub async fn build_icechunk_store(
+        &self,
         url: &Url,
+        prefix: Option<String>,
         virtual_chunks_url: Option<&Url>,
     ) -> Result<AsyncIcechunkStore, ZarrError> {
         let storage = match url.scheme() {
@@ -144,6 +179,37 @@ impl GeoZarrClient {
             }
             "http" | "https" => new_http_storage(url.as_str(), None, None)
                 .map_err(ZarrError::IcechunkStorageError)?,
+            "s3" => {
+                let (options, credentials) = if let Some(entry) =
+                    self.object_store_registry.get(url).map(|val| val.clone())
+                    && let Some(settings) = entry
+                {
+                    let credentials = if let Some(access_key_id) = settings.access_key_id
+                        && let Some(secret_access_key) = settings.secret_access_key
+                    {
+                        Some(S3Credentials::Static(S3StaticCredentials {
+                            access_key_id: access_key_id,
+                            secret_access_key: secret_access_key,
+                            session_token: None,
+                            expires_after: None,
+                        }))
+                    } else {
+                        None
+                    };
+                    let options = S3Options::default()
+                        .with_region(settings.region)
+                        .with_endpoint_url(settings.endpoint_url)
+                        .with_anonymous(settings.anonymous)
+                        .with_force_path_style(settings.force_path_style);
+                    (options, credentials)
+                } else {
+                    (S3Options::default(), None)
+                };
+                let bucket = normalize_s3_prefix(url.as_str());
+                new_s3_object_store_storage(options, bucket, prefix, credentials, vec![], vec![])
+                    .await
+                    .map_err(ZarrError::IcechunkStorageError)?
+            }
             scheme => Err(ZarrError::OjbectStoreError(Error::Generic {
                 store: "ObjectStoreRegistry",
                 source: format!("Unsupported object store scheme: {scheme}").into(),
@@ -186,6 +252,7 @@ impl GeoZarrClient {
     pub async fn get_or_build_store(
         &self,
         url: &Url,
+        prefix: Option<String>,
         virtual_chunks_url: Option<&Url>,
         store_type: StoreType,
     ) -> Result<Arc<ZarrStore>, ZarrError> {
@@ -200,7 +267,8 @@ impl GeoZarrClient {
                 Arc::new(ZarrStore::Zarr(AsyncObjectStore::new(obj_store)))
             }
             StoreType::Icechunk => Arc::new(ZarrStore::Icechunk(
-                Self::build_icechunk_store(url, virtual_chunks_url).await?,
+                self.build_icechunk_store(url, prefix, virtual_chunks_url)
+                    .await?,
             )),
         };
 
@@ -391,6 +459,7 @@ impl GeoZarrClient {
     pub async fn fetch_data(
         &self,
         url: &Url,
+        prefix: Option<String>,
         cell_ids: &[u64],
         data_var_name: &str,
         query_coords: HashMap<String, QuerySelection>,
@@ -405,7 +474,7 @@ impl GeoZarrClient {
 
         // Build Zarr store
         let zarr_store = self
-            .get_or_build_store(url, virtual_chunks_url, store_type)
+            .get_or_build_store(url, prefix, virtual_chunks_url, store_type)
             .await?;
 
         // Retrieve Zarr nodes
@@ -723,6 +792,14 @@ macro_rules! fetch_coords {
     };
 }
 
+fn normalize_s3_prefix(raw_prefix: &str) -> String {
+    let mut s = raw_prefix.trim();
+    if let Some(rest) = s.strip_prefix("s3://") {
+        s = rest;
+    }
+    s.into()
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -776,7 +853,15 @@ mod tests {
             .expect("should parse")
             .build();
         let data = client
-            .fetch_data(&url, &cells, "air", query_coords, StoreType::Zarr, None)
+            .fetch_data(
+                &url,
+                None,
+                &cells,
+                "air",
+                query_coords,
+                StoreType::Zarr,
+                None,
+            )
             .await
             .expect("should fetch");
         match data {
@@ -799,6 +884,7 @@ mod tests {
         let data = client
             .fetch_data(
                 &url,
+                None,
                 &cells,
                 "liquid_water",
                 query_coords,
@@ -830,6 +916,7 @@ mod tests {
         let data = client
             .fetch_data(
                 &url,
+                None,
                 &cells,
                 "RR",
                 query_coords,
@@ -866,6 +953,7 @@ mod tests {
         let data = client
             .fetch_data(
                 &url,
+                None,
                 &cells,
                 "RR",
                 query_coords,
@@ -880,5 +968,54 @@ mod tests {
             }
             _ => panic!("wrong data type"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_fetch_5() -> Result<(), Box<dyn std::error::Error>> {
+        let url = Url::parse("https://webgis.geoinformation.dev")?;
+        let config = ObjectStoreConfig {
+            region: "eu-central-1".to_string(),
+            endpoint_url: url,
+            bucket: "geozarr".to_string(),
+            force_path_style: true,
+            anonymous: true,
+            access_key_id: None,
+            secret_access_key: None,
+        };
+        let bucket = Url::parse("s3://geozarr")?;
+        let client = GeoZarrClient::new().with_object_store_config(bucket.clone(), config);
+        let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
+            .expect("should load cell ids");
+        let virtual_chunks_url =
+            Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
+        let query_coords = QueryCoordsBuilder::new()
+            .insert_range_dt_str(
+                "time",
+                Some("2025-10-01T00:00:00Z"),
+                Some("2025-12-01T00:00:00Z"),
+            )
+            .expect("should parse")
+            .build();
+
+        let data = client
+            .fetch_data(
+                &bucket,
+                Some("spartacus.icechunk.zarr".to_string()),
+                &cells,
+                "RR",
+                query_coords,
+                StoreType::Icechunk,
+                Some(&virtual_chunks_url),
+            )
+            .await
+            .expect("should fetch");
+        match data {
+            (SampledData::I32(data), coords) => {
+                println!("{coords:?}");
+                assert_eq!(data.len(), cells.len())
+            }
+            _ => panic!("wrong data type"),
+        }
+        Ok(())
     }
 }
