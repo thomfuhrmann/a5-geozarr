@@ -16,7 +16,7 @@ use crate::error::ZarrError;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum CoordValue {
-    Temporal(DateTime<Utc>),
+    DateTime(DateTime<Utc>),
     F32(f32),
     F64(f64),
     I32(i32),
@@ -85,8 +85,8 @@ impl CoordValue {
                 Ok(CoordValue::F64(val as f64))
             }
 
-            // temporal -> conversion handled separately based on raw f64
-            v @ CoordValue::Temporal(_) => Ok(v),
+            // datetime -> conversion handled separately based on raw f64
+            v @ CoordValue::DateTime(_) => Ok(v),
 
             found => Err(ZarrError::CastError(format!(
                 "Can not convert from {found:?} to {target:?}"
@@ -109,7 +109,7 @@ impl CoordValue {
             }
             Value::String(s) => {
                 if let Ok(dt) = s.parse::<DateTime<Utc>>() {
-                    Ok(CoordValue::Temporal(dt))
+                    Ok(CoordValue::DateTime(dt))
                 } else {
                     Err(format!("Unrecognized coordinate string: {s}"))
                 }
@@ -122,7 +122,7 @@ impl CoordValue {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum CoordValues {
     None,
-    Datetime(Vec<DateTime<Utc>>),
+    DateTime(Vec<DateTime<Utc>>),
     F32(Vec<f32>),
     F64(Vec<f64>),
     I16(Vec<i16>),
@@ -154,9 +154,9 @@ impl QuerySelection {
                 end: Some(e),
                 ..
             } => match (s, e) {
-                (CoordValue::Temporal(start), CoordValue::Temporal(end)) => {
+                (CoordValue::DateTime(start), CoordValue::DateTime(end)) => {
                     if start <= end {
-                        return Ok(());
+                        Ok(())
                     } else {
                         Err(ZarrError::CoordinateError(format!(
                             "Start must be before end: start {start}, end {end}"
@@ -165,7 +165,7 @@ impl QuerySelection {
                 }
                 (CoordValue::F32(start), CoordValue::F32(end)) => {
                     if start <= end {
-                        return Ok(());
+                        Ok(())
                     } else {
                         Err(ZarrError::CoordinateError(format!(
                             "Start must be before end: start {start}, end {end}"
@@ -174,7 +174,7 @@ impl QuerySelection {
                 }
                 (CoordValue::F64(start), CoordValue::F64(end)) => {
                     if start <= end {
-                        return Ok(());
+                        Ok(())
                     } else {
                         Err(ZarrError::CoordinateError(format!(
                             "Start must be before end: start {start}, end {end}"
@@ -183,7 +183,7 @@ impl QuerySelection {
                 }
                 (CoordValue::U32(start), CoordValue::U32(end)) => {
                     if start <= end {
-                        return Ok(());
+                        Ok(())
                     } else {
                         Err(ZarrError::CoordinateError(format!(
                             "Start must be before end: start {start}, end {end}"
@@ -192,7 +192,7 @@ impl QuerySelection {
                 }
                 (CoordValue::U64(start), CoordValue::U64(end)) => {
                     if start <= end {
-                        return Ok(());
+                        Ok(())
                     } else {
                         Err(ZarrError::CoordinateError(format!(
                             "Start must be before end: start {start}, end {end}"
@@ -201,7 +201,7 @@ impl QuerySelection {
                 }
                 (CoordValue::I32(start), CoordValue::I32(end)) => {
                     if start <= end {
-                        return Ok(());
+                        Ok(())
                     } else {
                         Err(ZarrError::CoordinateError(format!(
                             "Start must be before end: start {start}, end {end}"
@@ -210,7 +210,7 @@ impl QuerySelection {
                 }
                 (CoordValue::I64(start), CoordValue::I64(end)) => {
                     if start <= end {
-                        return Ok(());
+                        Ok(())
                     } else {
                         Err(ZarrError::CoordinateError(format!(
                             "Start must be before end: start {start}, end {end}"
@@ -267,7 +267,7 @@ impl QueryCoordsBuilder {
         dt_str: &str,
     ) -> Result<Self, ZarrError> {
         let dt = Self::convert_to_dt(dt_str).map_err(ZarrError::ChronoError)?;
-        Ok(self.insert_point(dim, CoordValue::Temporal(dt)))
+        Ok(self.insert_point(dim, CoordValue::DateTime(dt)))
     }
 
     /// Inserts a range query for datetime strings
@@ -279,13 +279,13 @@ impl QueryCoordsBuilder {
     ) -> Result<Self, ZarrError> {
         let start_dt = if let Some(val) = start_dt_str {
             let dt = Self::convert_to_dt(val).map_err(ZarrError::ChronoError)?;
-            Some(CoordValue::Temporal(dt))
+            Some(CoordValue::DateTime(dt))
         } else {
             None
         };
         let end_dt = if let Some(val) = end_dt_str {
             let dt = Self::convert_to_dt(val).map_err(ZarrError::ChronoError)?;
-            Some(CoordValue::Temporal(dt))
+            Some(CoordValue::DateTime(dt))
         } else {
             None
         };
@@ -299,7 +299,7 @@ impl QueryCoordsBuilder {
 
     /// Converts the fiven datetime string into a `chrono::DateTime<Utc>`
     pub fn convert_to_dt(dt_str: &str) -> Result<DateTime<Utc>, chrono::ParseError> {
-        Ok(DateTime::parse_from_rfc3339(dt_str.into())?.with_timezone(&Utc))
+        Ok(DateTime::parse_from_rfc3339(dt_str)?.with_timezone(&Utc))
     }
 }
 

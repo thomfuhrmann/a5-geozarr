@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     fmt::Debug,
     hash::Hasher,
@@ -36,7 +37,7 @@ use zarrs_icechunk::{
 use zarrs_object_store::AsyncObjectStore;
 
 use crate::{
-    dimension::{ChunkIndex, DimMeta},
+    dimension::{ChunkIndex, DimMeta, get_coord_values},
     error::ZarrError,
     geozarr::{
         GeozarrMetadata, calculate_resolution_levels, get_proj, get_spatial_dims,
@@ -47,7 +48,6 @@ use crate::{
     warp_grid::{TARGET_CRS, WarpGrid},
 };
 
-use crate::fetch_coords;
 use crate::sample;
 
 #[derive(Debug, Clone)]
@@ -103,13 +103,14 @@ pub struct ObjectStoreConfig {
     pub secret_access_key: Option<String>,
 }
 
+/// Client for GeoZarr data retrieval
 #[derive(Default, Clone)]
 pub struct GeoZarrClient {
     /// One warp grid per spatial crs and spatial transform
     pub warp_grids: Arc<DashMap<WarpCacheKey, WarpGrid>>,
     /// Registry for zarr stores
     pub store_registry: Arc<DashMap<Url, Arc<ZarrStore>>>,
-    /// Cache for mappings from coordinate values to chunk indices and offsets
+    /// Cache for mappings from coordinate values to chunk indices
     pub chunk_indices: Arc<DashMap<ChunkIndexKey, ChunkIndex>>,
     /// Options for object stores
     pub object_store_registry: Arc<DashMap<Url, Option<ObjectStoreConfig>>>,
@@ -302,39 +303,55 @@ impl GeoZarrClient {
 
                         let range = match sel {
                             QuerySelection::Point(coord) => {
-                                let offset = self.get_offset(&array, key, coord, &meta).await?;
-                                if let Some(offset) = offset {
-                                    Some(offset..(offset + 1))
-                                } else {
-                                    None
-                                }
+                                let (offset, _) =
+                                    self.get_offset(&array, key, coord, &meta).await?;
+                                offset.map(|offset| offset..(offset + 1))
                             }
                             QuerySelection::Range { start, end } => match (start, end) {
                                 (Some(start), Some(end)) => {
-                                    let start =
+                                    let (start, start_ordering) =
                                         self.get_offset(&array, key.clone(), start, &meta).await?;
-                                    let end = self.get_offset(&array, key, end, &meta).await?;
+                                    let (end, end_ordering) =
+                                        self.get_offset(&array, key, end, &meta).await?;
                                     match (start, end) {
                                         (Some(start), Some(end)) => Some(start..end + 1),
                                         (Some(start), None) => Some(start..total_len),
                                         (None, Some(end)) => Some(0..end + 1),
-                                        (None, None) => Some(0..total_len),
+                                        (None, None) => {
+                                            if start_ordering == Some(Ordering::Less)
+                                                && end_ordering == Some(Ordering::Greater)
+                                            {
+                                                Some(0..total_len)
+                                            } else {
+                                                None
+                                            }
+                                        }
                                     }
                                 }
                                 (Some(start), None) => {
-                                    let start = self.get_offset(&array, key, start, &meta).await?;
+                                    let (start, ordering) =
+                                        self.get_offset(&array, key, start, &meta).await?;
                                     if let Some(start) = start {
                                         Some(start..total_len)
                                     } else {
-                                        Some(0..total_len)
+                                        if ordering == Some(Ordering::Less) {
+                                            Some(0..total_len)
+                                        } else {
+                                            None
+                                        }
                                     }
                                 }
                                 (None, Some(end)) => {
-                                    let end = self.get_offset(&array, key, end, &meta).await?;
+                                    let (end, ordering) =
+                                        self.get_offset(&array, key, end, &meta).await?;
                                     if let Some(end) = end {
                                         Some(0..end + 1)
                                     } else {
-                                        Some(0..total_len)
+                                        if ordering == Some(Ordering::Greater) {
+                                            Some(0..total_len)
+                                        } else {
+                                            None
+                                        }
                                     }
                                 }
                                 (None, None) => Some(0..total_len),
@@ -342,8 +359,7 @@ impl GeoZarrClient {
                         };
 
                         if let Some(range) = range {
-                            let coords =
-                                Self::get_coord_values(&array, range.clone(), &meta).await?;
+                            let coords = get_coord_values(&array, range.clone(), &meta).await?;
                             (range, coords)
                         } else {
                             (0..0, CoordValues::None)
@@ -359,69 +375,18 @@ impl GeoZarrClient {
         Ok(dims_index)
     }
 
-    pub async fn get_coord_values(
-        array: &Array<ZarrStore>,
-        range: Range<u64>,
-        meta: &DimMeta,
-    ) -> Result<CoordValues, ZarrError> {
-        let coords = fetch_coords!(
-             array, range,
-            Float32DataType => (f32, F32),
-            Float64DataType => (f64, F64),
-            UInt8DataType => (u8, U8),
-            UInt16DataType => (u16, U16),
-            UInt32DataType => (u32, U32),
-            UInt64DataType => (u64, U64),
-            Int16DataType => (i16, I16),
-            Int32DataType => (i32, I32),
-            Int64DataType => (i64, I64),
-        )?;
-
-        if let DimMeta::Time(meta) = meta {
-            match coords {
-                CoordValues::F32(vals) => Ok(CoordValues::Datetime(
-                    vals.into_iter()
-                        .filter_map(|val| meta.raw_to_datetime(val as f64))
-                        .collect::<Vec<_>>(),
-                )),
-                CoordValues::F64(vals) => Ok(CoordValues::Datetime(
-                    vals.into_iter()
-                        .filter_map(|val| meta.raw_to_datetime(val))
-                        .collect::<Vec<_>>(),
-                )),
-                CoordValues::U32(vals) => Ok(CoordValues::Datetime(
-                    vals.into_iter()
-                        .filter_map(|val| meta.raw_to_datetime(val as f64))
-                        .collect::<Vec<_>>(),
-                )),
-                CoordValues::U64(vals) => Ok(CoordValues::Datetime(
-                    vals.into_iter()
-                        .filter_map(|val| meta.raw_to_datetime(val as f64))
-                        .collect::<Vec<_>>(),
-                )),
-                _ => {
-                    return Err(ZarrError::CoordinateError(
-                        "Unsupported data type for temporal dimension".to_string(),
-                    ));
-                }
-            }
-        } else {
-            Ok(coords)
-        }
-    }
-
     pub async fn get_offset(
         &self,
         array: &Array<ZarrStore>,
         key: ChunkIndexKey,
         val: CoordValue,
         meta: &DimMeta,
-    ) -> Result<Option<u64>, ZarrError> {
+    ) -> Result<(Option<u64>, Option<Ordering>), ZarrError> {
         let mut index = self.chunk_indices.entry(key).or_default();
         let data_type = array.data_type();
         let coerced = val.coerce_to(data_type)?;
         match coerced {
-            CoordValue::Temporal(val) => {
+            CoordValue::DateTime(val) => {
                 let DimMeta::Time(meta) = meta else {
                     return Err(ZarrError::AttributeError(
                         "Missing metadata for time array".into(),
@@ -429,29 +394,29 @@ impl GeoZarrClient {
                 };
                 let raw = meta.datetime_to_raw(&val);
                 if data_type.is::<Float32DataType>() {
-                    index.get_chunk_index(&array, raw as f32).await
+                    index.get_chunk_index(array, raw as f32).await
                 } else if data_type.is::<Float64DataType>() {
-                    index.get_chunk_index(&array, raw as f64).await
+                    index.get_chunk_index(array, raw).await
                 } else if data_type.is::<Int32DataType>() {
-                    index.get_chunk_index(&array, raw as i32).await
+                    index.get_chunk_index(array, raw as i32).await
                 } else if data_type.is::<Int64DataType>() {
-                    index.get_chunk_index(&array, raw as i64).await
+                    index.get_chunk_index(array, raw as i64).await
                 } else if data_type.is::<UInt32DataType>() {
-                    index.get_chunk_index(&array, raw as u32).await
+                    index.get_chunk_index(array, raw as u32).await
                 } else if data_type.is::<UInt64DataType>() {
-                    index.get_chunk_index(&array, raw as u64).await
+                    index.get_chunk_index(array, raw as u64).await
                 } else {
-                    return Err(ZarrError::DataTypeError(format!(
+                    Err(ZarrError::DataTypeError(format!(
                         "Unsupported data type: {data_type}"
-                    )));
+                    )))
                 }
             }
-            CoordValue::F32(val) => index.get_chunk_index(&array, val).await,
-            CoordValue::F64(val) => index.get_chunk_index(&array, val).await,
-            CoordValue::I32(val) => index.get_chunk_index(&array, val).await,
-            CoordValue::I64(val) => index.get_chunk_index(&array, val).await,
-            CoordValue::U32(val) => index.get_chunk_index(&array, val).await,
-            CoordValue::U64(val) => index.get_chunk_index(&array, val).await,
+            CoordValue::F32(val) => index.get_chunk_index(array, val).await,
+            CoordValue::F64(val) => index.get_chunk_index(array, val).await,
+            CoordValue::I32(val) => index.get_chunk_index(array, val).await,
+            CoordValue::I64(val) => index.get_chunk_index(array, val).await,
+            CoordValue::U32(val) => index.get_chunk_index(array, val).await,
+            CoordValue::U64(val) => index.get_chunk_index(array, val).await,
         }
     }
 
@@ -685,7 +650,7 @@ impl GeoZarrClient {
                     let map = spatial_indices
                         .iter()
                         .cloned()
-                        .zip([rel_down as usize, rel_right as usize].into_iter())
+                        .zip([rel_down as usize, rel_right as usize])
                         .collect::<HashMap<_, _>>();
                     let sample = Self::slice_at_point(array, &map)?;
                     sampled_data[idx] = Some(sample);
@@ -760,34 +725,6 @@ macro_rules! sample {
             Err($crate::error::ZarrError::DataTypeError(
                 format!("Unsupported data type: {:?}", data_type)
             ))
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! fetch_coords {
-    (
-        $array:expr, $range:expr,
-        $( $T:ty => ($numeric_type:ty, $Variant:ident) ),* $(,)?
-    ) => {
-        {
-            let data_type = $array.data_type();
-            $(
-                if data_type.is::<$T>() {
-                    match $array
-                        .async_retrieve_array_subset::<Vec<$numeric_type>>(&[$range])
-                        .await
-                    {
-                        Ok(subset) => Ok($crate::query::CoordValues::$Variant(subset)),
-                        Err(e) => Err($crate::error::ZarrError::ArrayError(e)),
-                    }
-                } else
-            )*
-            {
-                Err($crate::error::ZarrError::DataTypeError(
-                    format!("Unsupported data type: {:?}", data_type)
-                ))
-            }
         }
     };
 }

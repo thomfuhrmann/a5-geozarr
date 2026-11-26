@@ -1,8 +1,16 @@
+use std::{cmp::Ordering, ops::Range};
+
 use chrono::{DateTime, NaiveDate, TimeDelta, TimeZone, Utc};
 use moka::sync::Cache;
-use zarrs::array::{Array, ArrayBytes, ArrayError, ElementOwned};
+use zarrs::array::{
+    Array, ArrayBytes, ArrayError, ElementOwned,
+    data_type::{
+        Float32DataType, Float64DataType, Int16DataType, Int32DataType, Int64DataType,
+        UInt8DataType, UInt16DataType, UInt32DataType, UInt64DataType,
+    },
+};
 
-use crate::{error::ZarrError, store::ZarrStore};
+use crate::{error::ZarrError, query::CoordValues, store::ZarrStore};
 
 /// A key for the chunk cache
 pub trait CacheKey {
@@ -38,7 +46,7 @@ impl_integer_cache_key!(i32, i64, u32, u64);
 /// A cache for mappings from coordinate values to offsets
 #[derive(Debug, Clone)]
 pub struct ChunkIndex {
-    cache: Cache<u64, Option<u64>>,
+    cache: Cache<u64, (Option<u64>, Option<Ordering>)>,
 }
 
 impl Default for ChunkIndex {
@@ -62,49 +70,16 @@ impl ChunkIndex {
         &mut self,
         coords: &Array<ZarrStore>,
         val: T,
-    ) -> Result<Option<u64>, ZarrError> {
+    ) -> Result<(Option<u64>, Option<Ordering>), ZarrError> {
         let key = val.clone().to_cache_key();
         if let Some(loc) = self.cache.get(&key) {
             Ok(loc)
         } else {
-            let loc = find_absolute_offset(coords, val).await?;
-            self.cache.insert(key, loc);
-            Ok(loc)
+            let (loc, order) = find_absolute_offset(coords, val).await?;
+            self.cache.insert(key, (loc, order));
+            Ok((loc, order))
         }
     }
-}
-
-/// Checks if all chunks have uniform size
-fn is_uniform_chunk_grid(coords: &Array<ZarrStore>) -> Result<bool, ZarrError> {
-    let chunk_grid_shape = coords.chunk_grid_shape();
-    if chunk_grid_shape.len() != 1 {
-        return Err(ZarrError::CoordinateError(format!(
-            "Expected a chunk grid shape of length 1, got: {}",
-            chunk_grid_shape.len()
-        )));
-    }
-
-    let num_chunks = chunk_grid_shape[0];
-    let mut chunk_size = None;
-    for i in 0..num_chunks {
-        let chunk_shape = coords.chunk_shape(&[i]).map_err(ZarrError::ArrayError)?;
-        if chunk_shape.len() != 1 {
-            return Err(ZarrError::CoordinateError(format!(
-                "Expected a chunk shape of length 1, got: {}",
-                chunk_grid_shape.len()
-            )));
-        }
-
-        let local_chunk_size = u64::from(chunk_shape[0]);
-        if let Some(val) = chunk_size {
-            if val != local_chunk_size {
-                return Ok(false);
-            }
-        } else {
-            chunk_size = Some(local_chunk_size);
-        }
-    }
-    Ok(true)
 }
 
 /// Finds the absolute offset for both ascending and descending coordinate arrays
@@ -113,15 +88,15 @@ fn is_uniform_chunk_grid(coords: &Array<ZarrStore>) -> Result<bool, ZarrError> {
 async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + Clone>(
     coords: &Array<ZarrStore>,
     val: T,
-) -> Result<Option<u64>, ZarrError> {
+) -> Result<(Option<u64>, Option<Ordering>), ZarrError> {
     let shape = coords.shape();
     let total_len = shape[0];
     if total_len == 0 {
-        return Ok(None);
+        return Ok((None, None));
     }
 
     let bytes = ArrayBytes::new_fill_value(coords.data_type(), 1, coords.fill_value())
-        .map_err(|e| ZarrError::CodecError(e.into()))?;
+        .map_err(ZarrError::CodecError)?;
     let mut elements =
         T::from_array_bytes(coords.data_type(), bytes).map_err(ZarrError::ElementError)?;
     let null_val = elements
@@ -170,32 +145,29 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
 
             if order.is_before_start(&val, chunk_start_val) {
                 if mid_chunk == 0 {
-                    return Ok(None);
+                    return Ok((None, Some(Ordering::Less)));
+                } else if mid_chunk == low_chunk {
+                    return Ok((Some(mid_chunk * chunk_size - 1), None));
                 }
                 high_chunk = mid_chunk - 1;
             } else if order.is_past_end(&val, chunk_end_val) {
                 low_chunk = mid_chunk + 1;
             } else {
-                let local_offset = chunk
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, x)| *x != &null_val && val >= **x)
-                    .map(|(idx, _)| idx as u64)
-                    .ok_or_else(|| {
+                let local_offset =
+                    get_local_offset(&chunk, &null_val, &val, order).ok_or_else(|| {
                         ZarrError::CoordinateError("Can not find matching value".to_string())
                     })?;
 
                 let absolute_offset = (mid_chunk * chunk_size) + local_offset;
-                return Ok(Some(absolute_offset.min(total_len - 1)));
+                return Ok((Some(absolute_offset.min(total_len - 1)), None));
             }
         }
 
-        Ok(None)
+        Ok((None, Some(Ordering::Greater)))
     } else {
         let num_chunks = coords.chunk_grid_shape()[0];
         let mut abs_offset: u64 = 0;
-        let mut saw_any_non_null = false;
+        let mut any_non_null = false;
 
         for i in 0..num_chunks {
             let chunk = coords
@@ -217,36 +189,91 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
                 continue;
             };
 
-            saw_any_non_null = true;
+            any_non_null = true;
 
             if order.is_before_start(&val, chunk_start_val) {
-                return Ok(None);
+                if i == 0 {
+                    return Ok((None, Some(Ordering::Less)));
+                } else {
+                    return Ok((Some(abs_offset - 1), None));
+                }
             }
 
             if !order.is_past_end(&val, chunk_end_val) {
-                let local_offset = chunk
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, x)| *x != &null_val && val >= **x)
-                    .map(|(idx, _)| idx as u64)
-                    .ok_or_else(|| {
+                let local_offset =
+                    get_local_offset(&chunk, &null_val, &val, order).ok_or_else(|| {
                         ZarrError::CoordinateError("Can not find matching value".to_string())
                     })?;
 
-                return Ok(Some((abs_offset + local_offset).min(total_len - 1)));
+                return Ok((Some((abs_offset + local_offset).min(total_len - 1)), None));
             }
 
             abs_offset += chunk_len;
         }
 
-        if !saw_any_non_null {
+        if !any_non_null {
             return Err(ZarrError::CoordinateError(
                 "Array only contains null values".into(),
             ));
         }
 
-        Ok(None)
+        Ok((None, Some(Ordering::Greater)))
+    }
+}
+
+/// Checks if all chunks have uniform size
+fn is_uniform_chunk_grid(coords: &Array<ZarrStore>) -> Result<bool, ZarrError> {
+    let chunk_grid_shape = coords.chunk_grid_shape();
+    if chunk_grid_shape.len() != 1 {
+        return Err(ZarrError::CoordinateError(format!(
+            "Expected a chunk grid shape of length 1, got: {}",
+            chunk_grid_shape.len()
+        )));
+    }
+
+    let num_chunks = chunk_grid_shape[0];
+    let mut chunk_size = None;
+    for i in 0..num_chunks {
+        let chunk_shape = coords.chunk_shape(&[i]).map_err(ZarrError::ArrayError)?;
+        if chunk_shape.len() != 1 {
+            return Err(ZarrError::CoordinateError(format!(
+                "Expected a chunk shape of length 1, got: {}",
+                chunk_grid_shape.len()
+            )));
+        }
+
+        let local_chunk_size = u64::from(chunk_shape[0]);
+        if let Some(val) = chunk_size {
+            if val != local_chunk_size {
+                return Ok(false);
+            }
+        } else {
+            chunk_size = Some(local_chunk_size);
+        }
+    }
+    Ok(true)
+}
+
+/// Calculates the local chunk offset based on the given order
+fn get_local_offset<T: ElementOwned + PartialOrd>(
+    chunk: &[T],
+    null_val: &T,
+    val: &T,
+    order: SortOrder,
+) -> Option<u64> {
+    if order == SortOrder::Ascending {
+        chunk
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, x)| *x != null_val && val >= *x)
+            .map(|(idx, _)| idx as u64)
+    } else {
+        chunk
+            .iter()
+            .enumerate()
+            .find(|(_, x)| *x != null_val && val >= *x)
+            .map(|(idx, _)| idx as u64)
     }
 }
 
@@ -347,7 +374,7 @@ impl DimMeta {
     }
 }
 
-/// Metadata for temporal units and epoch
+/// Metadata for datetime units and epoch
 #[derive(Debug, Clone)]
 pub struct TimeMetadata {
     pub(crate) units: String,
@@ -417,6 +444,93 @@ impl TimeMetadata {
     }
 }
 
+#[macro_export]
+macro_rules! fetch_coords {
+    (
+        $array:expr, $range:expr,
+        $( $T:ty => ($numeric_type:ty, $Variant:ident) ),* $(,)?
+    ) => {
+        {
+            let data_type = $array.data_type();
+            $(
+                if data_type.is::<$T>() {
+                    match $array
+                        .async_retrieve_array_subset::<Vec<$numeric_type>>(&[$range])
+                        .await
+                    {
+                        Ok(subset) => Ok($crate::query::CoordValues::$Variant(subset)),
+                        Err(e) => Err($crate::error::ZarrError::ArrayError(e)),
+                    }
+                } else
+            )*
+            {
+                Err($crate::error::ZarrError::DataTypeError(
+                    format!("Unsupported data type: {:?}", data_type)
+                ))
+            }
+        }
+    };
+}
+
+pub async fn get_coord_values(
+    array: &Array<ZarrStore>,
+    range: Range<u64>,
+    meta: &DimMeta,
+) -> Result<CoordValues, ZarrError> {
+    let coords = fetch_coords!(
+         array, range,
+        Float32DataType => (f32, F32),
+        Float64DataType => (f64, F64),
+        UInt8DataType => (u8, U8),
+        UInt16DataType => (u16, U16),
+        UInt32DataType => (u32, U32),
+        UInt64DataType => (u64, U64),
+        Int16DataType => (i16, I16),
+        Int32DataType => (i32, I32),
+        Int64DataType => (i64, I64),
+    )?;
+
+    if let DimMeta::Time(meta) = meta {
+        match coords {
+            CoordValues::F32(vals) => Ok(CoordValues::DateTime(
+                vals.into_iter()
+                    .filter_map(|val| meta.raw_to_datetime(val as f64))
+                    .collect::<Vec<_>>(),
+            )),
+            CoordValues::F64(vals) => Ok(CoordValues::DateTime(
+                vals.into_iter()
+                    .filter_map(|val| meta.raw_to_datetime(val))
+                    .collect::<Vec<_>>(),
+            )),
+            CoordValues::U32(vals) => Ok(CoordValues::DateTime(
+                vals.into_iter()
+                    .filter_map(|val| meta.raw_to_datetime(val as f64))
+                    .collect::<Vec<_>>(),
+            )),
+            CoordValues::U64(vals) => Ok(CoordValues::DateTime(
+                vals.into_iter()
+                    .filter_map(|val| meta.raw_to_datetime(val as f64))
+                    .collect::<Vec<_>>(),
+            )),
+            CoordValues::I32(vals) => Ok(CoordValues::DateTime(
+                vals.into_iter()
+                    .filter_map(|val| meta.raw_to_datetime(val as f64))
+                    .collect::<Vec<_>>(),
+            )),
+            CoordValues::I64(vals) => Ok(CoordValues::DateTime(
+                vals.into_iter()
+                    .filter_map(|val| meta.raw_to_datetime(val as f64))
+                    .collect::<Vec<_>>(),
+            )),
+            _ => Err(ZarrError::CoordinateError(
+                "Unsupported data type for datetime dimension".to_string(),
+            )),
+        }
+    } else {
+        Ok(coords)
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -445,7 +559,7 @@ mod tests {
         let mut index = ChunkIndex::with_capacity(1000);
         if let DimMeta::Time(meta) = meta {
             let raw = meta.datetime_to_raw(&dt);
-            let loc = if data_type.is::<Int64DataType>() {
+            let (loc, _) = if data_type.is::<Int64DataType>() {
                 let val = raw as i64;
                 index.get_chunk_index(&array, val).await
             } else if data_type.is::<Float64DataType>() {
