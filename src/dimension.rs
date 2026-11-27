@@ -70,12 +70,13 @@ impl ChunkIndex {
         &mut self,
         coords: &Array<ZarrStore>,
         val: T,
+        reverse: bool,
     ) -> Result<(Option<u64>, Option<Ordering>), ZarrError> {
         let key = val.clone().to_cache_key();
         if let Some(loc) = self.cache.get(&key) {
             Ok(loc)
         } else {
-            let (loc, order) = find_absolute_offset(coords, val).await?;
+            let (loc, order) = find_absolute_offset(coords, val, reverse).await?;
             self.cache.insert(key, (loc, order));
             Ok((loc, order))
         }
@@ -88,6 +89,7 @@ impl ChunkIndex {
 async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + Clone>(
     coords: &Array<ZarrStore>,
     val: T,
+    reverse: bool,
 ) -> Result<(Option<u64>, Option<Ordering>), ZarrError> {
     let shape = coords.shape();
     let total_len = shape[0];
@@ -153,8 +155,8 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
             } else if order.is_past_end(&val, chunk_end_val) {
                 low_chunk = mid_chunk + 1;
             } else {
-                let local_offset =
-                    get_local_offset(&chunk, &null_val, &val, order).ok_or_else(|| {
+                let local_offset = get_local_offset(&chunk, &null_val, &val, order, reverse)
+                    .ok_or_else(|| {
                         ZarrError::CoordinateError("Can not find matching value".to_string())
                     })?;
 
@@ -200,8 +202,8 @@ async fn find_absolute_offset<T: ElementOwned + PartialOrd + std::fmt::Debug + C
             }
 
             if !order.is_past_end(&val, chunk_end_val) {
-                let local_offset =
-                    get_local_offset(&chunk, &null_val, &val, order).ok_or_else(|| {
+                let local_offset = get_local_offset(&chunk, &null_val, &val, order, reverse)
+                    .ok_or_else(|| {
                         ZarrError::CoordinateError("Can not find matching value".to_string())
                     })?;
 
@@ -260,20 +262,38 @@ fn get_local_offset<T: ElementOwned + PartialOrd>(
     null_val: &T,
     val: &T,
     order: SortOrder,
+    reverse: bool,
 ) -> Option<u64> {
     if order == SortOrder::Ascending {
-        chunk
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, x)| *x != null_val && val >= *x)
-            .map(|(idx, _)| idx as u64)
+        if reverse {
+            chunk
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, x)| *x != null_val && val >= *x)
+                .map(|(idx, _)| idx as u64)
+        } else {
+            chunk
+                .iter()
+                .enumerate()
+                .find(|(_, x)| *x != null_val && val <= *x)
+                .map(|(idx, _)| idx as u64)
+        }
     } else {
-        chunk
-            .iter()
-            .enumerate()
-            .find(|(_, x)| *x != null_val && val >= *x)
-            .map(|(idx, _)| idx as u64)
+        if reverse {
+            chunk
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, x)| *x != null_val && val <= *x)
+                .map(|(idx, _)| idx as u64)
+        } else {
+            chunk
+                .iter()
+                .enumerate()
+                .find(|(_, x)| *x != null_val && val >= *x)
+                .map(|(idx, _)| idx as u64)
+        }
     }
 }
 
@@ -561,10 +581,10 @@ mod tests {
             let raw = meta.datetime_to_raw(&dt);
             let (loc, _) = if data_type.is::<Int64DataType>() {
                 let val = raw as i64;
-                index.get_chunk_index(&array, val).await
+                index.get_chunk_index(&array, val, true).await
             } else if data_type.is::<Float64DataType>() {
                 let val = raw; // already f64
-                index.get_chunk_index(&array, val).await
+                index.get_chunk_index(&array, val, true).await
             } else {
                 panic!("Unsupported time coordinate data type");
             }

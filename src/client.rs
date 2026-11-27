@@ -96,11 +96,23 @@ impl ChunkIndexKey {
 pub struct ObjectStoreConfig {
     pub region: String,
     pub endpoint_url: Url,
-    pub bucket: String,
     pub force_path_style: bool,
     pub anonymous: bool,
     pub access_key_id: Option<String>,
     pub secret_access_key: Option<String>,
+}
+
+impl ObjectStoreConfig {
+    pub fn new(endpoint_url: Url) -> Self {
+        ObjectStoreConfig {
+            region: "eu-central-1".into(),
+            endpoint_url,
+            force_path_style: true,
+            anonymous: false,
+            access_key_id: None,
+            secret_access_key: None,
+        }
+    }
 }
 
 /// Client for GeoZarr data retrieval
@@ -113,7 +125,7 @@ pub struct GeoZarrClient {
     /// Cache for mappings from coordinate values to chunk indices
     pub chunk_indices: Arc<DashMap<ChunkIndexKey, ChunkIndex>>,
     /// Options for object stores
-    pub object_store_registry: Arc<DashMap<Url, Option<ObjectStoreConfig>>>,
+    pub object_store_configs: Arc<DashMap<Url, Option<ObjectStoreConfig>>>,
 }
 
 impl Debug for GeoZarrClient {
@@ -121,7 +133,7 @@ impl Debug for GeoZarrClient {
         f.debug_struct("GeoZarrClient")
             .field("warp_grids", &self.warp_grids)
             .field("chunk_indices", &self.chunk_indices)
-            .field("object_store_registry", &self.object_store_registry)
+            .field("object_store_configs", &self.object_store_configs)
             .finish()
     }
 }
@@ -132,7 +144,7 @@ impl GeoZarrClient {
     }
 
     pub fn with_object_store_config(self, bucket: Url, config: ObjectStoreConfig) -> Self {
-        self.object_store_registry.insert(bucket, Some(config));
+        self.object_store_configs.insert(bucket, Some(config));
         self
     }
 
@@ -182,7 +194,7 @@ impl GeoZarrClient {
                 .map_err(ZarrError::IcechunkStorageError)?,
             "s3" => {
                 let (options, credentials) = if let Some(entry) =
-                    self.object_store_registry.get(url).map(|val| val.clone())
+                    self.object_store_configs.get(url).map(|val| val.clone())
                     && let Some(settings) = entry
                 {
                     let credentials = if let Some(access_key_id) = settings.access_key_id
@@ -304,15 +316,16 @@ impl GeoZarrClient {
                         let range = match sel {
                             QuerySelection::Point(coord) => {
                                 let (offset, _) =
-                                    self.get_offset(&array, key, coord, &meta).await?;
+                                    self.get_offset(&array, key, coord, &meta, true).await?;
                                 offset.map(|offset| offset..(offset + 1))
                             }
                             QuerySelection::Range { start, end } => match (start, end) {
                                 (Some(start), Some(end)) => {
-                                    let (start, start_ordering) =
-                                        self.get_offset(&array, key.clone(), start, &meta).await?;
+                                    let (start, start_ordering) = self
+                                        .get_offset(&array, key.clone(), start, &meta, false)
+                                        .await?;
                                     let (end, end_ordering) =
-                                        self.get_offset(&array, key, end, &meta).await?;
+                                        self.get_offset(&array, key, end, &meta, true).await?;
                                     match (start, end) {
                                         (Some(start), Some(end)) => Some(start..end + 1),
                                         (Some(start), None) => Some(start..total_len),
@@ -330,7 +343,7 @@ impl GeoZarrClient {
                                 }
                                 (Some(start), None) => {
                                     let (start, ordering) =
-                                        self.get_offset(&array, key, start, &meta).await?;
+                                        self.get_offset(&array, key, start, &meta, false).await?;
                                     if let Some(start) = start {
                                         Some(start..total_len)
                                     } else {
@@ -343,7 +356,7 @@ impl GeoZarrClient {
                                 }
                                 (None, Some(end)) => {
                                     let (end, ordering) =
-                                        self.get_offset(&array, key, end, &meta).await?;
+                                        self.get_offset(&array, key, end, &meta, true).await?;
                                     if let Some(end) = end {
                                         Some(0..end + 1)
                                     } else {
@@ -381,6 +394,7 @@ impl GeoZarrClient {
         key: ChunkIndexKey,
         val: CoordValue,
         meta: &DimMeta,
+        reverse: bool,
     ) -> Result<(Option<u64>, Option<Ordering>), ZarrError> {
         let mut index = self.chunk_indices.entry(key).or_default();
         let data_type = array.data_type();
@@ -394,29 +408,29 @@ impl GeoZarrClient {
                 };
                 let raw = meta.datetime_to_raw(&val);
                 if data_type.is::<Float32DataType>() {
-                    index.get_chunk_index(array, raw as f32).await
+                    index.get_chunk_index(array, raw as f32, reverse).await
                 } else if data_type.is::<Float64DataType>() {
-                    index.get_chunk_index(array, raw).await
+                    index.get_chunk_index(array, raw, reverse).await
                 } else if data_type.is::<Int32DataType>() {
-                    index.get_chunk_index(array, raw as i32).await
+                    index.get_chunk_index(array, raw as i32, reverse).await
                 } else if data_type.is::<Int64DataType>() {
-                    index.get_chunk_index(array, raw as i64).await
+                    index.get_chunk_index(array, raw as i64, reverse).await
                 } else if data_type.is::<UInt32DataType>() {
-                    index.get_chunk_index(array, raw as u32).await
+                    index.get_chunk_index(array, raw as u32, reverse).await
                 } else if data_type.is::<UInt64DataType>() {
-                    index.get_chunk_index(array, raw as u64).await
+                    index.get_chunk_index(array, raw as u64, reverse).await
                 } else {
                     Err(ZarrError::DataTypeError(format!(
                         "Unsupported data type: {data_type}"
                     )))
                 }
             }
-            CoordValue::F32(val) => index.get_chunk_index(array, val).await,
-            CoordValue::F64(val) => index.get_chunk_index(array, val).await,
-            CoordValue::I32(val) => index.get_chunk_index(array, val).await,
-            CoordValue::I64(val) => index.get_chunk_index(array, val).await,
-            CoordValue::U32(val) => index.get_chunk_index(array, val).await,
-            CoordValue::U64(val) => index.get_chunk_index(array, val).await,
+            CoordValue::F32(val) => index.get_chunk_index(array, val, reverse).await,
+            CoordValue::F64(val) => index.get_chunk_index(array, val, reverse).await,
+            CoordValue::I32(val) => index.get_chunk_index(array, val, reverse).await,
+            CoordValue::I64(val) => index.get_chunk_index(array, val, reverse).await,
+            CoordValue::U32(val) => index.get_chunk_index(array, val, reverse).await,
+            CoordValue::U64(val) => index.get_chunk_index(array, val, reverse).await,
         }
     }
 
@@ -909,11 +923,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_5() -> Result<(), Box<dyn std::error::Error>> {
-        let url = Url::parse("https://webgis.geoinformation.dev")?;
+        let endpoint_url = Url::parse("https://webgis.geoinformation.dev")?;
         let config = ObjectStoreConfig {
             region: "eu-central-1".to_string(),
-            endpoint_url: url,
-            bucket: "geozarr".to_string(),
+            endpoint_url,
             force_path_style: true,
             anonymous: true,
             access_key_id: None,
@@ -923,15 +936,13 @@ mod tests {
         let client = GeoZarrClient::new().with_object_store_config(bucket.clone(), config);
         let cells = read_cell_ids(Path::new("tests/fixtures/a5_15_hzb_fid_13987.csv"))
             .expect("should load cell ids");
-        let virtual_chunks_url =
-            Url::parse("https://public.hub.geosphere.at/").expect("should parse url");
+        let virtual_chunks_url = Url::parse("https://public.hub.geosphere.at/")?;
         let query_coords = QueryCoordsBuilder::new()
             .insert_range_dt_str(
                 "time",
-                Some("2025-10-01T00:00:00Z"),
+                Some("2025-09-01T00:00:00Z"),
                 Some("2025-12-01T00:00:00Z"),
-            )
-            .expect("should parse")
+            )?
             .build();
 
         let data = client
@@ -944,8 +955,7 @@ mod tests {
                 StoreType::Icechunk,
                 Some(&virtual_chunks_url),
             )
-            .await
-            .expect("should fetch");
+            .await?;
         match data {
             (SampledData::I32(data), coords) => {
                 println!("{coords:?}");
