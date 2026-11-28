@@ -9,29 +9,34 @@ bytemuck = "1.25.2"
 chrono = "0.4.43"
 dashmap = "6.2.1"
 icechunk = "2.3.0"
-image = "0.25.9"
 inventory = "0.3.25"
 moka = { version = "0.12.16", features = ["future"] }
 ndarray = "0.17.2"
-object_store = { version = "0.14.2", features = [
-    "http",
-    "aws",
-    "azure",
-    "gcp",
-] }
-proj = "0.31.0"
-rusqlite = { version = "0.35.0", features = ["bundled"] }
+proj = "0.32.0"
 serde = "1.0.229"
 serde_json = "1.0.154"
 thiserror = "2.0.21"
-tilejson = "0.4.4"
-tokio = "1.53.3"
 url = "2.5.8"
-zarr-cast-value = "0.4.2"
+zarr-cast-value = "0.5.1"
 zarrs = { version = "0.23.0", features = ["async", "zlib"] }
 zarrs_icechunk = "0.6.0"
 zarrs_object_store = "0.7.0"
 zarrs_plugin = "0.4.1"
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+object_store = { version = "0.14.2", default-features = false, features = [
+    "http-base",
+] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+object_store = { version = "0.14.2", default-features = false, features = [
+    "fs",
+    "http",
+    "aws",
+    "azure",
+    "gcp",
+] }
+
 [dev-dependencies]
+tokio = "1.53.3"
 csv = "1.4.0"

@@ -247,6 +247,7 @@ impl ArrayToArrayCodecTraits for CastValueCodec {
                 let config = IntToFloatConfig {
                     map_entries,
                     rounding: self.rounding.unwrap_or(RoundingMode::NearestEven),
+                    out_of_range: None,
                 };
                 convert_slice_int_to_float(raw_bytes, &mut decoded_bytes, &config)
                     .map_err(|e| CodecError::Other(e.to_string()))?;
@@ -277,6 +278,7 @@ impl ArrayToArrayCodecTraits for CastValueCodec {
                 let config = IntToFloatConfig {
                     map_entries,
                     rounding: self.rounding.unwrap_or(RoundingMode::NearestEven),
+                    out_of_range: None,
                 };
                 convert_slice_int_to_float(raw_bytes, &mut decoded_bytes, &config)
                     .map_err(|e| CodecError::Other(e.to_string()))?;

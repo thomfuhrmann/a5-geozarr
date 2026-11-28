@@ -2,7 +2,6 @@
 
 use std::{array::TryFromSliceError, num::ParseFloatError, path::PathBuf};
 
-use image::ImageError;
 use zarrs::array::{ElementError, data_type::api::DataTypeFillValueError};
 use zarrs_icechunk::icechunk::{StorageError, repository::RepositoryError};
 
@@ -10,16 +9,16 @@ use zarrs_icechunk::icechunk::{StorageError, repository::RepositoryError};
 #[non_exhaustive]
 #[derive(thiserror::Error, Debug)]
 pub enum ZarrError {
-    /// IO error.
+    /// IO error
     #[error("IO error {0}: {1}")]
     IoError(#[source] std::io::Error, PathBuf),
-    /// Filesystem create error
+    /// Object store error
     #[error("Object store create error: {0}")]
-    OjbectStoreError(#[source] object_store::Error),
+    ObjectStoreError(#[source] object_store::Error),
     /// Zarr array error
     #[error("Zarr array error: {0}")]
     ArrayError(#[source] zarrs::array::ArrayError),
-    /// Zarr array error
+    /// Zarr array creation error
     #[error("Zarr array create error: {0}")]
     ArrayCreateError(#[source] zarrs::array::ArrayCreateError),
     /// Zarr group create error
@@ -43,11 +42,11 @@ pub enum ZarrError {
     /// Projection creation error
     #[error("Projection create error: {0}")]
     ProjCreateError(#[source] proj::ProjCreateError),
-    /// Projection error
+    /// General projection error
     #[error("Conversion error: {0}")]
     ProjError(#[source] proj::ProjError),
-    /// Time error
-    #[error("Time attribute error: {0}")]
+    /// Time metadata error
+    #[error("Time metadata error: {0}")]
     TimeError(String),
     /// Dimension error
     #[error("Dimension error: {0}")]
@@ -64,9 +63,6 @@ pub enum ZarrError {
     /// Warp error
     #[error("Warp error: {0}")]
     WarpError(String),
-    /// Image error
-    #[error("Image error: {0}")]
-    ImageError(#[source] ImageError),
     /// Parameter error
     #[error("Parameter error: {0}")]
     ParameterError(String),
